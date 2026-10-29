@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-16"
+let buildTag = "Build 20261030-17"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -948,6 +948,23 @@ final class CursorShare {
                 SwitchSync.shared.noteLocalEsc()
             }
         }
+        // 検索の連動: 手元で ⌘+Space を押したら起点になり、打鍵を全端末へ送る
+        if awayTo == nil, !holding, forwardTo == nil {
+            if type == .keyDown {
+                let kc = event.getIntegerValueField(.keyboardEventKeycode)
+                if kc == 49, event.flags.contains(.maskCommand) {
+                    if SearchSync.shared.origin { SearchSync.shared.noteLocalEnd() } else { SearchSync.shared.noteLocalOpen() }
+                } else if SearchSync.shared.origin {
+                    if kc == 53 || kc == 36 || kc == 76 || kc == 51 {
+                        SearchSync.shared.forwardKey(keycode: kc)
+                    } else if !event.flags.contains(.maskCommand), !event.flags.contains(.maskControl) {
+                        SearchSync.shared.forwardChars(NSEvent(cgEvent: event)?.characters)
+                    }
+                }
+            } else if SearchSync.shared.origin, type == .leftMouseDown || type == .rightMouseDown {
+                SearchSync.shared.noteLocalEnd()
+            }
+        }
 
         // 他機起点のセッションに参加中(保持者・中継者): 物理マウスは位置がずれるので飲む。⌘Esc で全体リセット
         if holding || forwardTo != nil {
@@ -1209,6 +1226,14 @@ final class CursorShare {
             SwitchSync.shared.openLocal()
         case "done":
             SwitchSync.shared.receiveDone()
+        case "srch":
+            SearchSync.shared.receiveOpen()
+        case "stext":
+            if parts.count >= 3 { SearchSync.shared.receiveText(parts[2]) }
+        case "skey":
+            if parts.count >= 3 { SearchSync.shared.receiveKey(parts[2]) }
+        case "sdone":
+            SearchSync.shared.receiveDone()
         case "identify":
             IdentifyGlow.shared.showSelf()
         case "mv", "dn", "up", "sc", "kd", "ku", "fl":
@@ -2419,6 +2444,149 @@ final class SwitchSync {
     }
 }
 
+// MARK: - 検索の連動 (⌘+Space)
+/// どこかの Mac で ⌘+Space を押すと、他の端末でも検索が開き、打った文字が全端末に届く。
+/// Enter で各端末の最上位ヒットを開いて閉じ、Esc / クリック / 他アプリへの切替で全端末の検索を閉じる。
+/// 起点は Mac のみ(Windows は受ける側)。IME の変換は送られないので、英数字での検索向き。
+final class SearchSync {
+    static let shared = SearchSync()
+
+    var enabled: Bool {
+        get { UserDefaults.standard.object(forKey: "searchSync") == nil ? true : UserDefaults.standard.bool(forKey: "searchSync") }
+        set { UserDefaults.standard.set(newValue, forKey: "searchSync") }
+    }
+
+    private(set) var origin = false     // 自分が起点(打鍵を送る側)
+    private(set) var receiving = false  // 合図を受けて検索を開いている側
+    private var timer: Timer?
+
+    func start() {
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appActivated), name: NSWorkspace.didActivateApplicationNotification, object: nil)
+    }
+
+    @objc private func appActivated() {
+        // 起点で他のアプリに切り替わった = 検索が終わった
+        if origin { noteLocalEnd() }
+    }
+
+    private func sendAll(_ kind: String, _ rest: String? = nil) {
+        for pid in LinkNet.peers.keys {
+            LinkNet.sendFast(rest == nil ? "\(kind) \(pid)" : "\(kind) \(pid) \(rest!)")
+        }
+    }
+
+    private func armTimer() {
+        timer?.invalidate()
+        let t = Timer(timeInterval: 30, repeats: false) { [weak self] _ in self?.timeout() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+    private func disarm() { timer?.invalidate(); timer = nil }
+    private func timeout() {
+        if origin { origin = false; sendAll("sdone") }
+        if receiving { receiving = false; postKeyCode(53) }
+    }
+
+    // MARK: 起点側
+
+    /// 手元で ⌘+Space を押した
+    func noteLocalOpen() {
+        guard enabled, !receiving, !origin else { return }
+        origin = true
+        armTimer()
+        sendAll("srch")
+    }
+
+    /// 起点の特殊キー(Esc / Enter / バックスペース)
+    func forwardKey(keycode: Int64) {
+        guard origin else { return }
+        if keycode == 53 {
+            noteLocalEnd()
+        } else if keycode == 36 || keycode == 76 {
+            sendAll("skey", "ret")
+            origin = false
+            disarm()
+        } else if keycode == 51 {
+            sendAll("skey", "bs")
+        }
+    }
+
+    /// 起点の文字入力
+    func forwardChars(_ s: String?) {
+        guard origin, let s = s, !s.isEmpty else { return }
+        sendAll("stext", Data(s.utf8).base64EncodedString())
+    }
+
+    /// 起点の検索終了: 他端末の検索も閉じる
+    func noteLocalEnd() {
+        guard origin else { return }
+        origin = false
+        disarm()
+        sendAll("sdone")
+    }
+
+    // MARK: 受信側
+
+    func receiveOpen() {
+        guard enabled, !origin, !receiving else { return }
+        receiving = true
+        armTimer()
+        postKeyCode(49, flags: .maskCommand)
+    }
+
+    func receiveText(_ b64: String) {
+        guard receiving, let d = Data(base64Encoded: b64), let s = String(data: d, encoding: .utf8) else { return }
+        postText(s)
+    }
+
+    func receiveKey(_ which: String) {
+        guard receiving else { return }
+        if which == "bs" {
+            postKeyCode(51)
+        } else if which == "ret" {
+            postKeyCode(36)
+            receiving = false
+            disarm()
+        }
+    }
+
+    func receiveDone() {
+        guard receiving else { return }
+        receiving = false
+        disarm()
+        postKeyCode(53)
+    }
+
+    // MARK: キーの合成
+
+    private func postKeyCode(_ code: Int64, flags: CGEventFlags = []) {
+        DispatchQueue.main.async {
+            for down in [true, false] {
+                if let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: down) {
+                    e.flags = flags
+                    CursorShare.markSynthetic(e)
+                    e.post(tap: .cghidEventTap)
+                }
+            }
+        }
+    }
+
+    private func postText(_ s: String) {
+        DispatchQueue.main.async {
+            for ch in s {
+                let units = Array(String(ch).utf16)
+                for down in [true, false] {
+                    if let e = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: down) {
+                        e.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+                        CursorShare.markSynthetic(e)
+                        e.post(tap: .cghidEventTap)
+                    }
+                }
+            }
+        }
+    }
+}
+
 // MARK: - アプリ本体
 
 /// メニューバー用の「指3本」アイコン(テンプレート画像)
@@ -2458,6 +2626,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var cursorAtItem: NSMenuItem!
     var snapItem: NSMenuItem!
     var switchItem: NSMenuItem!
+    var searchItem: NSMenuItem!
     var loginItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -2482,6 +2651,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         snapItem = NSMenuItem(title: "ダイアログの既定ボタンへカーソルを移動", action: #selector(toggleSnap), keyEquivalent: "")
         switchItem = NSMenuItem(title: "切り替え画面の連動", action: #selector(toggleSwitch), keyEquivalent: "")
         switchItem.target = self
+        searchItem = NSMenuItem(title: "検索の連動", action: #selector(toggleSearch), keyEquivalent: "")
+        searchItem.target = self
         snapItem.target = self
         let layoutItem = NSMenuItem(title: "レイアウトを編集…", action: #selector(openLayoutEditor), keyEquivalent: "")
         layoutItem.target = self
@@ -2526,7 +2697,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self
-        menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(snapItem); menu.addItem(switchItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
+        menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(snapItem); menu.addItem(switchItem); menu.addItem(searchItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
         cursorShowItem = NSMenuItem(title: "カーソルを大きく表示", action: #selector(toggleCursorShow), keyEquivalent: "")
         cursorShowItem.target = self
@@ -2586,6 +2757,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ClipShare.shared.start()
         DialogSnap.shared.start()
         SwitchSync.shared.start()
+        SearchSync.shared.start()
 
         cursorOverlay.start()
         refreshCursorMenu()
@@ -2639,6 +2811,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         clipItem.state = ClipShare.shared.enabled ? .on : .off
         snapItem.state = DialogSnap.shared.enabled ? .on : .off
         switchItem.state = SwitchSync.shared.enabled ? .on : .off
+        searchItem.state = SearchSync.shared.enabled ? .on : .off
         tapItem.state = Engine.shared.keyTapSession ? .on : .off
         diagItem.state = UserDefaults.standard.bool(forKey: "showDiag") ? .on : .off
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -2723,6 +2896,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func toggleSwitch() {
         SwitchSync.shared.enabled.toggle()
+        refreshMenu()
+    }
+
+    @objc func toggleSearch() {
+        SearchSync.shared.enabled.toggle()
         refreshMenu()
     }
 

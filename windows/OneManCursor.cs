@@ -40,7 +40,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-16";
+    private const string BuildTag = "Build 20261030-17";
 
     private static string SpecId(string spec)
     {
@@ -98,6 +98,8 @@ internal static class Program
     private static System.Threading.SynchronizationContext uiCtx;
     // 切り替え画面の連動(タスクビュー / Alt+Tab)
     private static bool switching = false;
+    private static bool searching = false;
+    private static DateTime searchAt = DateTime.MinValue;
     private static DateTime switchAt = DateTime.MinValue;
     private static bool winTabArmed = false;
     private static IntPtr kbHook = IntPtr.Zero;
@@ -174,6 +176,16 @@ internal static class Program
         i.type = INPUT_KEYBOARD;
         i.u.ki.wVk = vk;
         i.u.ki.dwFlags = keyUp ? KEYEVENTF_KEYUP : 0;
+        return i;
+    }
+
+    private static INPUT MakeUnicode(char ch, bool keyUp)
+    {
+        INPUT i = new INPUT();
+        i.type = INPUT_KEYBOARD;
+        i.u.ki.wVk = 0;
+        i.u.ki.wScan = ch;
+        i.u.ki.dwFlags = 0x0004 | (keyUp ? KEYEVENTF_KEYUP : 0u);
         return i;
     }
 
@@ -612,6 +624,7 @@ internal static class Program
             }
             catch (Exception) { }
         }
+        if (searching && (DateTime.Now - searchAt).TotalSeconds > 30) { searching = false; PressKey(0x1B); }
         uint seq = GetClipboardSequenceNumber();
         if (!clipEnabled) { lastClipSeq = seq; clipSeqReady = true; return; }
         if (!clipSeqReady) { lastClipSeq = seq; clipSeqReady = true; return; }
@@ -790,6 +803,39 @@ internal static class Program
         if (kind == "at") { if (args.Length >= 1) cursorAt = args[0]; return; }
         if (kind == "open") { OpenSwitchLocal(); return; }
         if (kind == "done") { ReceiveDoneSwitch(); return; }
+        if (kind == "srch")
+        {
+            if (!searching)
+            {
+                searching = true; searchAt = DateTime.Now;
+                Log("検索連動: 検索を開きます");
+                SendInputs(MakeKey(0x5B, false), MakeKey(0x53, false), MakeKey(0x53, true), MakeKey(0x5B, true)); // Win+S
+            }
+            return;
+        }
+        if (kind == "stext" && args.Length >= 3 && searching)
+        {
+            try
+            {
+                string s = Encoding.UTF8.GetString(Convert.FromBase64String(args[2]));
+                var list = new List<INPUT>();
+                foreach (char ch in s) { list.Add(MakeUnicode(ch, false)); list.Add(MakeUnicode(ch, true)); }
+                if (list.Count > 0) SendInputs(list.ToArray());
+            }
+            catch (Exception) { }
+            return;
+        }
+        if (kind == "skey" && args.Length >= 3 && searching)
+        {
+            if (args[2] == "bs") PressKey(0x08);
+            else if (args[2] == "ret") { PressKey(0x0D); searching = false; }
+            return;
+        }
+        if (kind == "sdone")
+        {
+            if (searching) { searching = false; PressKey(0x1B); }
+            return;
+        }
         if (kind == "identify") { ShowIdentify(); return; }
         if (kind == "enter")
         {

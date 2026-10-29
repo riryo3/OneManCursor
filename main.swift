@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-15"
+let buildTag = "Build 20261030-16"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -946,14 +946,6 @@ final class CursorShare {
                 SwitchSync.shared.noteLocalOpen()
             } else if kc == 53, !event.flags.contains(.maskCommand) {
                 SwitchSync.shared.noteLocalEsc()
-            }
-        }
-        // ⌘+Tab(アプリ切り替え)も連動の対象にする: 開始で合図、⌘ を離したら確定
-        if awayTo == nil, !holding, forwardTo == nil {
-            if type == .keyDown, event.getIntegerValueField(.keyboardEventKeycode) == 48, event.flags.contains(.maskCommand) {
-                SwitchSync.shared.noteCmdTab()
-            } else if type == .flagsChanged, !event.flags.contains(.maskCommand) {
-                SwitchSync.shared.noteCmdUp()
             }
         }
 
@@ -2315,7 +2307,6 @@ final class SwitchSync {
         set { UserDefaults.standard.set(newValue, forKey: "switchSync") }
     }
     private(set) var switching = false
-    private var cmdTabArmed = false
     private var timer: Timer?
     private var observer: NSObjectProtocol?
     private var mcTimer: Timer?
@@ -2347,20 +2338,6 @@ final class SwitchSync {
     /// 自分が Esc で一覧を閉じた: 確定と同じ扱いで、他端末の一覧も閉じさせる
     func noteLocalEsc() {
         guard enabled, switching else { return }
-        decide()
-    }
-
-    /// ⌘+Tab の開始: 一覧を開いた扱いにし、他端末へ合図する
-    func noteCmdTab() {
-        guard enabled, !cmdTabArmed else { return }
-        cmdTabArmed = true
-        noteLocalOpen()
-    }
-
-    /// ⌘ を離した = ⌘+Tab の確定
-    func noteCmdUp() {
-        guard enabled, cmdTabArmed else { return }
-        cmdTabArmed = false
         decide()
     }
 
@@ -2419,7 +2396,6 @@ final class SwitchSync {
 
     private func setFlag(_ on: Bool) {
         switching = on
-        if !on { cmdTabArmed = false }
         timer?.invalidate()
         timer = nil
         if on {

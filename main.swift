@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-9"
+let buildTag = "Build 20261030-10"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -663,6 +663,7 @@ final class CursorShare {
     private var holding = false      // カーソルが自分の画面にある(他機起点)
     private var cameFrom: String?    // 保持者のとき: 渡してきた相手
     private var forwardTo: String?   // 中継中: さらに先の相手
+    private(set) var cursorAtID: String?   // カーソルが今いるマシン(全台で共有する現在地)
     private var vx: Double = 0, vy: Double = 0
 
     // 画面移動の調整(メニュー「画面移動の調整」で変更)
@@ -1140,6 +1141,7 @@ final class CursorShare {
                 }
                 LinkNet.sendReset()
                 status("カーソル共有： 一周して戻りました")
+                sendAtSelf()
                 return
             }
             // 自分が起点でも、カーソルが手元に戻っている状態なら受け取れる(セッションは相手に譲る)。
@@ -1148,6 +1150,7 @@ final class CursorShare {
             sending = false
             holding = true
             cameFrom = from
+            sendAtSelf()
             if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: entryRatio(forPeer: from, seg: seg)) }
             warp()
             status("カーソル共有： \(peerName(from)) から受け取りました")
@@ -1161,12 +1164,14 @@ final class CursorShare {
                 stopPinning()
                 if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: entryRatio(forPeer: from, seg: seg)); warp() }
                 status("カーソル共有： 手元に戻りました")
+                sendAtSelf()
             } else if forwardTo == from {
                 // 中継していた先から戻ってきた → 自分が保持者になる(cameFrom は元の相手のまま)
                 forwardTo = nil
                 holding = true
                 if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: entryRatio(forPeer: from, seg: seg)); warp() }
                 status("カーソル共有： 戻ってきました")
+                sendAtSelf()
             }
         case "assign":
             // レイアウトの割り当て: リンク表を丸ごと差し替える
@@ -1184,6 +1189,8 @@ final class CursorShare {
             }
             setLinks(newLinks)
             status("レイアウト： 割り当てを受けました")
+        case "at":
+            if let holder = rest.first { cursorAtID = holder }
         case "mv", "dn", "up", "sc", "kd", "ku", "fl":
             if holding {
                 apply(kind, args: rest)
@@ -1193,6 +1200,14 @@ final class CursorShare {
             }
         default:
             break
+        }
+    }
+
+    /// カーソルの現在地を全マシンへ知らせる(自分が保持者になったとき)
+    private func sendAtSelf() {
+        cursorAtID = LinkNet.machineID
+        for pid in LinkNet.peers.keys where pid != LinkNet.machineID {
+            LinkNet.sendFast("at \(pid) \(LinkNet.machineID)")
         }
     }
 
@@ -2228,6 +2243,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var pushItems: [NSMenuItem] = []
     var multItems: [NSMenuItem] = []
     var clipItem: NSMenuItem!
+    var cursorAtItem: NSMenuItem!
     var snapItem: NSMenuItem!
     var loginItem: NSMenuItem!
 
@@ -2238,6 +2254,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         let buildItem = NSMenuItem(title: buildTag, action: nil, keyEquivalent: "")
         buildItem.isEnabled = false
+        cursorAtItem = NSMenuItem(title: "カーソル: 自分", action: nil, keyEquivalent: "")
+        cursorAtItem.isEnabled = false
         enabledItem = NSMenuItem(title: "有効", action: #selector(toggleEnabled), keyEquivalent: "")
         enabledItem.target = self
         remoteItem = NSMenuItem(title: "リモート操作モード（Moonlight 使用時も有効）", action: #selector(toggleRemote), keyEquivalent: "")
@@ -2293,7 +2311,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self
-        menu.addItem(buildItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(snapItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
+        menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(snapItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
         cursorShowItem = NSMenuItem(title: "カーソルを大きく表示", action: #selector(toggleCursorShow), keyEquivalent: "")
         cursorShowItem.target = self
@@ -2409,6 +2427,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         for it in pushItems { it.state = it.tag == CursorShare.pushPx ? .on : .off }
         for it in multItems { it.state = it.tag == Int((CursorShare.moveMult * 100).rounded()) ? .on : .off }
+        if let hid = CursorShare.shared.cursorAtID, hid != LinkNet.machineID {
+            cursorAtItem.title = "カーソル: \(LayoutStore.name(of: hid))"
+        } else {
+            cursorAtItem.title = "カーソル: 自分"
+        }
     }
 
     var flashRestore: DispatchWorkItem?
@@ -2447,7 +2470,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        if menu == item.menu { refreshCursorMenu() }
+        if menu == item.menu { refreshCursorMenu(); refreshMenu() }
     }
 
     @objc func openLayoutEditor() {

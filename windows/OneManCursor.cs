@@ -40,7 +40,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-9";
+    private const string BuildTag = "Build 20261030-10";
 
     private static string SpecId(string spec)
     {
@@ -94,6 +94,7 @@ internal static class Program
     private static bool holding = false;
     private static string cameFrom = null;
     private static string forwardTo = null;
+    private static string cursorAt = null; // カーソルが今いるマシン
     private static double vx = 0, vy = 0;
     private static int pushPx = 0;
     private static double pushAccR = 0, pushAccL = 0, pushAccD = 0, pushAccU = 0;
@@ -590,6 +591,17 @@ internal static class Program
         SendClipText(text);
     }
 
+    // カーソルの現在地を全マシンへ知らせる(自分が保持者になったとき)
+    private static void SendAtSelf()
+    {
+        cursorAt = myId;
+        List<string> ids = new List<string>(peers.Keys);
+        foreach (string pid in ids)
+        {
+            if (pid != myId) SendFast("at " + pid + " " + myId);
+        }
+    }
+
     private static void ReceiveCursor(string kind, string[] rest, string from)
     {
         // rest[0] は宛先ID
@@ -599,6 +611,7 @@ internal static class Program
 
         if (kind == "clip") { HandleClipChunk(args, from); return; }
         if (kind == "assign") { HandleAssign(args); return; }
+        if (kind == "at") { if (args.Length >= 1) cursorAt = args[0]; return; }
         if (kind == "enter")
         {
             if (holding || forwardTo != null || args.Length < 1) return;
@@ -616,6 +629,7 @@ internal static class Program
             if (d == null) d = DirOf(from);
             if (d != null) PositionAtEdge(d, ratio, from);
             Log("カーソル共有: " + PeerName(from) + " から受け取りました");
+            SendAtSelf();
         }
         else if (kind == "leave")
         {
@@ -628,6 +642,7 @@ internal static class Program
                 string d = DirOf(from);
                 if (d != null) PositionAtEdge(d, ratio, from);
                 Log("カーソル共有: 戻ってきました");
+                SendAtSelf();
             }
         }
         else
@@ -760,6 +775,7 @@ internal static class Program
     private sealed class TrayContext : ApplicationContext
     {
         private readonly NotifyIcon icon;
+        private readonly ToolStripMenuItem cursorItem;
         private readonly System.Windows.Forms.Timer clipTimer;
 
         public TrayContext()
@@ -767,6 +783,13 @@ internal static class Program
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add("ログを表示", null, delegate { ShowLogWindow(); });
             menu.Items.Add(BuildTag, null, null).Enabled = false;
+            cursorItem = new ToolStripMenuItem("カーソル: 自分");
+            cursorItem.Enabled = false;
+            menu.Items.Add(cursorItem);
+            menu.Opening += delegate
+            {
+                cursorItem.Text = (cursorAt == null || cursorAt == myId) ? "カーソル: 自分" : "カーソル: " + PeerName(cursorAt);
+            };
             menu.Items.Add("自分の ID: " + myId, null, null).Enabled = false;
             ToolStripMenuItem clipItem = new ToolStripMenuItem("クリップボード共有");
             clipItem.Checked = clipEnabled;

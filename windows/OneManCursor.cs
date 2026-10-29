@@ -40,7 +40,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-21";
+    private const string BuildTag = "Build 20261030-23";
 
     private static string SpecId(string spec)
     {
@@ -131,6 +131,33 @@ internal static class Program
 
     // ---- user32 ----
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool QueryFullProcessImageName(IntPtr hProcess, uint flags, StringBuilder text, ref uint size);
+    [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr h);
+
+    private static bool IsForegroundSearch()
+    {
+        try
+        {
+            IntPtr fg = GetForegroundWindow();
+            if (fg == IntPtr.Zero) return false;
+            uint pid;
+            GetWindowThreadProcessId(fg, out pid);
+            IntPtr h = OpenProcess(0x1000, false, pid);
+            if (h == IntPtr.Zero) return false;
+            var sb = new StringBuilder(1024);
+            uint size = (uint)sb.Capacity;
+            bool ok = QueryFullProcessImageName(h, 0, sb, ref size);
+            CloseHandle(h);
+            if (!ok) return false;
+            string exe = sb.ToString();
+            return exe.IndexOf("SearchHost", StringComparison.OrdinalIgnoreCase) >= 0
+                || exe.IndexOf("SearchApp", StringComparison.OrdinalIgnoreCase) >= 0
+                || exe.IndexOf("SearchUI", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+        catch (Exception) { return false; }
+    }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
     [DllImport("user32.dll")] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
@@ -673,6 +700,7 @@ internal static class Program
     /// 合図を受けて自分のタスクビューを開く
     private static void OpenSwitchLocal()
     {
+        if (SwitchAlive()) return; // 既に開いているときに Win+Tab を送るとトグルで閉じてしまう
         Log("切り替え連動: 合図でタスクビューを開きます");
         SetSwitching(true);
         SendInputs(MakeKey(0x5B, false), MakeKey(0x09, false), MakeKey(0x09, true), MakeKey(0x5B, true));
@@ -712,6 +740,8 @@ internal static class Program
             try
             {
                 int vk = System.Runtime.InteropServices.Marshal.ReadInt32(lParam);
+                int flags = System.Runtime.InteropServices.Marshal.ReadInt32(lParam, 8);
+                if ((flags & 0x10) != 0) return CallNextHookEx(kbHook, nCode, wParam, lParam); // 注入されたキー(自分の合図など)は物理キーと誤認しない
                 int msg = wParam.ToInt32();
                 bool down = msg == 0x0100 || msg == 0x0104;
                 bool up = msg == 0x0101 || msg == 0x0105;
@@ -742,7 +772,7 @@ internal static class Program
     {
         // 最前面ウィンドウの変化 = タスクビューでの確定(開いた直後の変化は除く)
         if (!SwitchAlive()) return;
-        if ((DateTime.Now - switchAt).TotalMilliseconds < 700) return;
+        if ((DateTime.Now - switchAt).TotalMilliseconds < 1200) return;
         DecideSwitch();
     }
 
@@ -813,16 +843,26 @@ internal static class Program
             }
             return;
         }
-        if (kind == "stext" && args.Length >= 3 && searching)
+        if (kind == "sqry" && args.Length >= 3 && searching)
         {
-            try
+            if (!IsForegroundSearch()) { searching = false; return; }
+            string text = "";
+            if (args[2] != "~")
             {
-                string s = Encoding.UTF8.GetString(Convert.FromBase64String(args[2]));
-                var list = new List<INPUT>();
-                foreach (char ch in s) { list.Add(MakeUnicode(ch, false)); list.Add(MakeUnicode(ch, true)); }
-                if (list.Count > 0) SendInputs(list.ToArray());
+                try { text = Encoding.UTF8.GetString(Convert.FromBase64String(args[2])); }
+                catch (Exception) { text = ""; }
             }
-            catch (Exception) { }
+            var qlist = new List<INPUT>();
+            qlist.Add(MakeKey(0x11, false)); qlist.Add(MakeKey(0x41, false)); qlist.Add(MakeKey(0x41, true)); qlist.Add(MakeKey(0x11, true)); // Ctrl+A
+            if (text.Length == 0)
+            {
+                qlist.Add(MakeKey(0x08, false)); qlist.Add(MakeKey(0x08, true));
+            }
+            else
+            {
+                foreach (char ch in text) { qlist.Add(MakeUnicode(ch, false)); qlist.Add(MakeUnicode(ch, true)); }
+            }
+            SendInputs(qlist.ToArray());
             return;
         }
         if (kind == "skey" && args.Length >= 3 && searching)

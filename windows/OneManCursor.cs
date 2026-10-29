@@ -286,10 +286,10 @@ internal static class Program
             }
         }
         string pv;
-        string cv;
-        if (kv.TryGetValue("colors", out cv) && cv.Length > 0)
+        string colorsV;
+        if (kv.TryGetValue("colors", out colorsV) && colorsV.Length > 0)
         {
-            foreach (string tok in cv.Split(';'))
+            foreach (string tok in colorsV.Split(';'))
             {
                 int eq = tok.IndexOf('=');
                 if (eq > 0) colorMap[tok.Substring(0, eq)] = tok.Substring(eq + 1);

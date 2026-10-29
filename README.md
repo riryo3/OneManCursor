@@ -8,7 +8,14 @@ Mac のメニューバー常駐アプリ。3つの道具を1つにまとめま�
 
 詳しい使い方は [つかいかた.md](つかいかた.md) を見てください。
 
-## ビルド
+## 入手
+
+[Releases](https://github.com/riryo3/OneManCursor/releases) から完成品をダウンロードできます。
+
+- **Mac**: `OneManCursor.zip` を展開し、`OneManCursor.app` をアプリケーションフォルダへ。初回は右クリック →「開く」で起動し、アクセシビリティと入力監視の許可を付けてください
+- **Windows**(カーソル共有の相手役): `OneManCursor-Windows.zip` の `OneManCursor.exe` を起動すると、タスクトレイに常駐します
+
+## 自分でビルドする場合
 
 Xcode の入った Mac で:
 
@@ -16,7 +23,7 @@ Xcode の入った Mac で:
 sh build.sh
 ```
 
-`OneManCursor.app` ができます。初回起動時に、アクセシビリティと入力監視の許可が要ります。
+`OneManCursor.app` ができます。
 
 Windows 側は `windows/` フォルダで `build.bat` を実行すると `OneManCursor.exe` ができます(タスクトレイに常駐します)。
 

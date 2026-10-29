@@ -2077,7 +2077,7 @@ final class DialogSnap {
     var enabled = UserDefaults.standard.bool(forKey: "snapToDialog")
     private var observer: AXObserver?
     private var observedPID: pid_t = 0
-    private var seenWindows = Set<Int>()
+    private var seenWindows = Set<String>()
     private var workspaceObserver: NSObjectProtocol?
 
     func start() {
@@ -2130,13 +2130,27 @@ final class DialogSnap {
         for w in windows { inspect(window: w) }
     }
 
+    /// ウィンドウの識別子(同じダイアログへ二度運ばないため)
+    private func windowKey(_ window: AXUIElement) -> String {
+        var pos = CGPoint.zero
+        var size = CGSize.zero
+        var posRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posRef) == .success, let posV = posRef {
+            AXValueGetValue(posV as! AXValue, .cgPoint, &pos)
+        }
+        if AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success, let sizeV = sizeRef {
+            AXValueGetValue(sizeV as! AXValue, .cgSize, &size)
+        }
+        return "\(CFHash(window))|\(Int(pos.x)),\(Int(pos.y)),\(Int(size.width)),\(Int(size.height))"
+    }
+
     func inspect(window: AXUIElement) {
         guard enabled, !CursorShare.shared.anySessionActive else { return }
-        var wid: CGWindowID = 0
-        _ = _AXUIElementGetWindow(window, &wid)
-        if wid != 0 {
-            if seenWindows.contains(Int(wid)) { return }
-            seenWindows.insert(Int(wid))
+        let key = windowKey(window)
+        if !key.isEmpty {
+            if seenWindows.contains(key) { return }
+            seenWindows.insert(key)
             if seenWindows.count > 200 { seenWindows.removeAll() }
         }
         guard isDialogLike(window) else { return }

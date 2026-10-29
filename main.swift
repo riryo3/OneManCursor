@@ -1680,7 +1680,7 @@ enum LayoutStore {
 }
 
 /// レイアウト編集のキャンバス。タイルをドラッグして並べ、辺がくっついた相手を隣にする。
-/// スナップ有効時は、他のタイルの辺(隣接)・上辺・下辺・中央に吸着し、ガイド線を出す
+/// スナップ有効時は、他のタイルの辺・中央線に、自分の辺・中心が吸着し、ガイド線を出す
 final class LayoutCanvasView: NSView {
     private var pos: [String: (x: Double, y: Double)] = LayoutStore.loadPos()
     var snapEnabled = UserDefaults.standard.object(forKey: "layoutSnap") as? Bool ?? true
@@ -1833,11 +1833,11 @@ final class LayoutCanvasView: NSView {
             for o in others {
                 let ox = Double(o.minX), oMaxX = Double(o.maxX), oMidX = Double(o.midX)
                 let oy = Double(o.minY), oMaxY = Double(o.maxY), oMidY = Double(o.midY)
-                for (cand, guide) in [(ox - w, ox), (oMaxX, oMaxX), (ox, ox), (oMaxX - w, oMaxX), (oMidX - w / 2, oMidX)] {
+                for (cand, guide) in [(ox - w, ox), (oMaxX, oMaxX), (ox, ox), (oMaxX - w, oMaxX), (oMidX - w / 2, oMidX), (oMidX, oMidX), (oMidX - w, oMidX), (ox - w / 2, ox), (oMaxX - w / 2, oMaxX)] {
                     let d = abs(cand - nx)
                     if d <= threshold && (bestX == nil || d < bestX!.delta) { bestX = (cand, d, guide) }
                 }
-                for (cand, guide) in [(oy - h, oy), (oMaxY, oMaxY), (oy, oy), (oMaxY - h, oMaxY), (oMidY - h / 2, oMidY)] {
+                for (cand, guide) in [(oy - h, oy), (oMaxY, oMaxY), (oy, oy), (oMaxY - h, oMaxY), (oMidY - h / 2, oMidY), (oMidY, oMidY), (oMidY - h, oMidY), (oy - h / 2, oy), (oMaxY - h / 2, oMaxY)] {
                     let d = abs(cand - ny)
                     if d <= threshold && (bestY == nil || d < bestY!.delta) { bestY = (cand, d, guide) }
                 }
@@ -1956,7 +1956,7 @@ final class LayoutWindowController: NSWindowController {
         canvas = LayoutCanvasView(frame: NSRect(x: 0, y: 0, width: 680, height: 470))
         canvas.setContentHuggingPriority(.defaultLow, for: .vertical)
         canvas.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let snapBox = NSButton(checkboxWithTitle: "スナップ（辺・上辺・下辺・中央に吸着）", target: self, action: #selector(toggleSnap(_:)))
+        let snapBox = NSButton(checkboxWithTitle: "スナップ（辺・中央線に吸着）", target: self, action: #selector(toggleSnap(_:)))
         snapBox.state = canvas.snapEnabled ? .on : .off
         let hint = NSTextField(labelWithString: "辺がくっつくと隣になります。タイル右上の丸で、そのマシンの色を変更できます")
         hint.textColor = .secondaryLabelColor

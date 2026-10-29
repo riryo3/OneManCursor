@@ -1451,7 +1451,7 @@ final class EdgeGlow {
 
     func show(dir: PartnerDir, link lk: PeerLink) {
         let c = colorFromHex(machineColorHex(of: lk.id))
-        DispatchQueue.main.async { [weak self] in
+        onMain { [weak self] in
             guard let self = self else { return }
             self.ensureWindow()
             self.dir = dir
@@ -1464,10 +1464,15 @@ final class EdgeGlow {
     }
 
     func hide() {
-        DispatchQueue.main.async { [weak self] in
+        onMain { [weak self] in
             self?.targetAlpha = 0
             self?.startTimer()
         }
+    }
+
+    /// メインスレッド上なら即実行し、show/hide の順序の入れ替わりを防ぐ
+    private func onMain(_ work: @escaping () -> Void) {
+        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
     }
 
     private func ensureWindow() {
@@ -1481,7 +1486,7 @@ final class EdgeGlow {
         w.backgroundColor = .clear
         w.hasShadow = false
         w.ignoresMouseEvents = true
-        w.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.overlayWindow)))
+        w.level = .screenSaver
         w.collectionBehavior = [.canJoinAllSpaces, .stationary]
         window = w
         view = v
@@ -1489,7 +1494,7 @@ final class EdgeGlow {
 
     private func startTimer() {
         if timer != nil { return }
-        timer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
+        let t = Timer(timeInterval: 0.03, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             let diff = self.targetAlpha - self.alpha
             self.alpha = abs(diff) < 0.04 ? self.targetAlpha : self.alpha + diff * 0.35
@@ -1502,6 +1507,8 @@ final class EdgeGlow {
             self.window?.orderFrontRegardless()
             self.view?.needsDisplay = true
         }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 }
 

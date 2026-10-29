@@ -40,7 +40,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-12";
+    private const string BuildTag = "Build 20261030-13";
 
     private static string SpecId(string spec)
     {
@@ -95,6 +95,7 @@ internal static class Program
     private static string cameFrom = null;
     private static string forwardTo = null;
     private static string cursorAt = null; // カーソルが今いるマシン
+    private static System.Threading.SynchronizationContext uiCtx;
     // 切り替え画面の連動(タスクビュー / Alt+Tab)
     private static bool switching = false;
     private static DateTime switchAt = DateTime.MinValue;
@@ -739,6 +740,51 @@ internal static class Program
         DecideSwitch();
     }
 
+    /// 画面確認: 自分の色で画面全体を薄く光らせる
+    private static Form identifyForm;
+    private static void ShowIdentify()
+    {
+        if (uiCtx == null) return;
+        uiCtx.Post(delegate
+        {
+            try
+            {
+                if (identifyForm == null)
+                {
+                    identifyForm = new Form();
+                    identifyForm.FormBorderStyle = FormBorderStyle.None;
+                    identifyForm.ShowInTaskbar = false;
+                    identifyForm.TopMost = true;
+                    identifyForm.StartPosition = FormStartPosition.Manual;
+                    Label lb = new Label();
+                    lb.Name = "lb";
+                    lb.Dock = DockStyle.Fill;
+                    lb.TextAlign = ContentAlignment.MiddleCenter;
+                    lb.Font = new Font("Yu Gothic UI", 48, FontStyle.Bold);
+                    lb.ForeColor = Color.White;
+                    identifyForm.Controls.Add(lb);
+                }
+                Color c = Color.FromArgb(0, 120, 215);
+                string hex;
+                if (colorMap.TryGetValue(myId, out hex))
+                {
+                    try { c = ColorTranslator.FromHtml(hex); } catch (Exception) { }
+                }
+                identifyForm.BackColor = c;
+                identifyForm.Opacity = 0.35;
+                identifyForm.Bounds = SystemInformation.VirtualScreen;
+                ((Label)identifyForm.Controls["lb"]).Text = myName;
+                identifyForm.Show();
+                identifyForm.BringToFront();
+                System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
+                t.Interval = 1600;
+                t.Tick += delegate { t.Stop(); identifyForm.Hide(); t.Dispose(); };
+                t.Start();
+            }
+            catch (Exception) { }
+        }, null);
+    }
+
     private static void ReceiveCursor(string kind, string[] rest, string from)
     {
         // rest[0] は宛先ID
@@ -751,6 +797,7 @@ internal static class Program
         if (kind == "at") { if (args.Length >= 1) cursorAt = args[0]; return; }
         if (kind == "open") { OpenSwitchLocal(); return; }
         if (kind == "done") { ReceiveDoneSwitch(); return; }
+        if (kind == "identify") { ShowIdentify(); return; }
         if (kind == "enter")
         {
             if (holding || forwardTo != null || args.Length < 1) return;
@@ -944,6 +991,7 @@ internal static class Program
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("終了", null, delegate { Exit(); });
             InstallSwitchHooks();
+            uiCtx = System.Threading.SynchronizationContext.Current;
             icon = new NotifyIcon();
             icon.Text = "ワンマンカーソル " + BuildTag + " (ID: " + myId + ")";
             icon.Icon = MakeWaIcon();

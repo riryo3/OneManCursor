@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-12"
+let buildTag = "Build 20261030-13"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1209,6 +1209,8 @@ final class CursorShare {
             SwitchSync.shared.openLocal()
         case "done":
             SwitchSync.shared.receiveDone()
+        case "identify":
+            IdentifyGlow.shared.showSelf()
         case "mv", "dn", "up", "sc", "kd", "ku", "fl":
             if holding {
                 apply(kind, args: rest)
@@ -1993,6 +1995,67 @@ final class LayoutCanvasView: NSView {
     }
 }
 
+/// 画面確認: 自分のマシンの色で画面全体を薄く光らせる(レイアウト編集の「画面で確認」用)
+final class IdentifyGlow {
+    static let shared = IdentifyGlow()
+    private var window: NSWindow?
+    private var view: IdentifyGlowView?
+    private var generation = 0
+
+    func showSelf() {
+        let c = colorFromHex(machineColorHex(of: LinkNet.machineID))
+        let name = LayoutStore.name(of: LinkNet.machineID)
+        if Thread.isMainThread { show(color: c, name: name) }
+        else { DispatchQueue.main.async { [weak self] in self?.show(color: c, name: name) } }
+    }
+
+    private func show(color: NSColor, name: String) {
+        generation += 1
+        let gen = generation
+        ensureWindow()
+        view?.color = color
+        view?.name = name
+        view?.needsDisplay = true
+        window?.orderFrontRegardless()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+            guard let self = self, self.generation == gen else { return }
+            self.window?.orderOut(nil)
+        }
+    }
+
+    private func ensureWindow() {
+        if window != nil { return }
+        let union = NSScreen.screens.reduce(NSRect.zero) { $0.union($1.frame) }
+        let v = IdentifyGlowView(frame: NSRect(origin: .zero, size: union.size))
+        let w = NSWindow(contentRect: union, styleMask: [.borderless], backing: .buffered, defer: false)
+        w.contentView = v
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = false
+        w.ignoresMouseEvents = true
+        w.level = .screenSaver
+        w.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        window = w
+        view = v
+    }
+}
+
+final class IdentifyGlowView: NSView {
+    var color: NSColor = .systemBlue
+    var name: String = ""
+    override func draw(_ dirtyRect: NSRect) {
+        color.withAlphaComponent(0.30).setFill()
+        bounds.fill()
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: 72),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.9),
+        ]
+        let s = NSAttributedString(string: name, attributes: attrs)
+        let size = s.size()
+        s.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2))
+    }
+}
+
 /// レイアウト編集ウィンドウ
 final class LayoutWindowController: NSWindowController {
     private var canvas: LayoutCanvasView!
@@ -2003,11 +2066,13 @@ final class LayoutWindowController: NSWindowController {
         canvas.setContentHuggingPriority(.defaultLow, for: .vertical)
         canvas.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let snapBox = NSButton(checkboxWithTitle: "スナップ（辺・中央線に吸着）", target: self, action: #selector(toggleSnap(_:)))
+        let idButton = NSButton(title: "画面で確認", target: self, action: #selector(identifyScreens))
+        idButton.bezelStyle = .rounded
         snapBox.state = canvas.snapEnabled ? .on : .off
         let hint = NSTextField(labelWithString: "辺がくっつくと隣になります。タイル右上の丸で、そのマシンの色を変更できます")
         hint.textColor = .secondaryLabelColor
         hint.font = .systemFont(ofSize: 11)
-        let bar = NSStackView(views: [snapBox, hint])
+        let bar = NSStackView(views: [snapBox, idButton, hint])
         bar.orientation = .horizontal
         bar.spacing = 16
         bar.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
@@ -2025,6 +2090,14 @@ final class LayoutWindowController: NSWindowController {
     @objc func toggleSnap(_ b: NSButton) {
         canvas.snapEnabled = b.state == .on
         UserDefaults.standard.set(canvas.snapEnabled, forKey: "layoutSnap")
+    }
+
+    /// 全端末の画面を、それぞれの色で光らせる(どのタイルがどの実機か確かめる)
+    @objc func identifyScreens() {
+        for pid in LinkNet.peers.keys where pid != LinkNet.machineID {
+            LinkNet.sendFast("identify \(pid)")
+        }
+        IdentifyGlow.shared.showSelf()
     }
 }
 

@@ -157,13 +157,6 @@ final class Engine {
             note = "（カーソル共有で送信）"
         } else if isFinder {
             postKey(for: action)
-        } else if linkMode {
-            // ユニバーサルコントロールは合成キーを相手側へ転送しないので、
-            // 手元で処理されなかったスワイプは「合図」として相方に送る。
-            // Moonlight のときも、相方モードがオンならキー直送より合図を優先する
-            // (Windows など、受け側でキー変換が必要な相手にも同じ合図で届くため)
-            LinkNet.send(action.wire)
-            note = "（合図を送信）"
         } else if isRemote {
             postKey(for: action)
         } else {
@@ -815,9 +808,10 @@ final class CursorShare {
             return Unmanaged.passUnretained(event)
         }
         guard enabled else { return Unmanaged.passUnretained(event) }
-        let isEsc = type == .keyDown && event.getIntegerValueField(.keyboardEventKeycode) == 53
+        // 非常口は ⌘Esc。Esc 単体はよく使うキーなので、普通のキーとして相手へ送る
+        let isEsc = type == .keyDown && event.getIntegerValueField(.keyboardEventKeycode) == 53 && event.flags.contains(.maskCommand)
 
-        // 他機起点のセッションに参加中(保持者・中継者): 物理マウスは位置がずれるので飲む。Esc で全体リセット
+        // 他機起点のセッションに参加中(保持者・中継者): 物理マウスは位置がずれるので飲む。⌘Esc で全体リセット
         if holding || forwardTo != nil {
             if isEsc {
                 LinkNet.sendReset()
@@ -832,12 +826,12 @@ final class CursorShare {
         // 自分が起点
         if sending {
             if awayTo == nil {
-                // カーソルは手元にある: 通常どおり通しつつ、端を監視する。Esc で自分のセッション状態を掃除する
+                // カーソルは手元にある: 通常どおり通しつつ、端を監視する。⌘Esc で自分のセッション状態を掃除する
                 if isEsc { resetSession() }
                 if isMove(type), checkEdges(event) { return nil }
                 return Unmanaged.passUnretained(event)
             }
-            // カーソルは相手側: Esc で終了、それ以外は合図に変えて飲む
+            // カーソルは相手側: ⌘Esc で終了、それ以外は合図に変えて飲む
             if isEsc {
                 LinkNet.sendReset()
                 resetSession()

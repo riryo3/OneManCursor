@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-25"
+let buildTag = "Build 20261030-26"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -140,6 +140,13 @@ final class Engine {
             // 縦: 下へ = 上の階層、上へ = 開く
             if abs(dy) >= vertMin, abs(dy) >= 2 * abs(dx) {
                 fire(dy > 0 ? .open : .parent)
+            }
+        } else if lockedCount == 4 {
+            // 4本指の縦スワイプは Mission Control / Exposé のジェスチャ(切り替え連動の検知)
+            if abs(dy) >= vertMin, abs(dy) >= 2 * abs(dx) {
+                fired = true
+                let up = dy > 0
+                DispatchQueue.main.async { SwitchSync.shared.noteGesture(up: up) }
             }
         }
     }
@@ -947,7 +954,10 @@ final class CursorShare {
         if type == .keyDown, awayTo == nil, !holding, forwardTo == nil {
             let kc = event.getIntegerValueField(.keyboardEventKeycode)
             if kc == 126, event.flags.contains(.maskControl), !event.flags.contains(.maskCommand) {
-                SwitchSync.shared.noteLocalOpen()
+                SwitchSync.shared.noteOpenKey()
+            } else if kc == 99, !event.flags.contains(.maskCommand) {
+                // MCキー(F3): 標準キーとして届く場合
+                SwitchSync.shared.noteOpenKey()
             } else if kc == 53, !event.flags.contains(.maskCommand) {
                 SwitchSync.shared.noteLocalEsc()
             }
@@ -2362,6 +2372,15 @@ final class DialogSnap {
 
 /// 切り替え画面の連動: どこかの端末でウィンドウ選択を確定したら、他の端末で
 /// 開いている Mission Control / タスクビューを Esc で閉じる
+func switchKeyCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
+    // MCキーなど特殊キー(システム定義イベント)の足跡をログに残すための聞き専用タップ
+    if type.rawValue == 14, let ns = NSEvent(cgEvent: event) {
+        let d1 = ns.data1
+        NetLog.shared.log("システムキー: subtype=\(ns.subtype.rawValue) keyType=\((d1 >> 16) & 0xFFFF) state=\((d1 >> 8) & 0xFF)")
+    }
+    return Unmanaged.passUnretained(event)
+}
+
 final class SwitchSync {
     static let shared = SwitchSync()
     var enabled: Bool {
@@ -2371,10 +2390,6 @@ final class SwitchSync {
     private(set) var switching = false
     private var timer: Timer?
     private var observer: NSObjectProtocol?
-    private var mcTimer: Timer?
-    private var mcActive = false
-    private var mcOn = 0
-    private var mcOff = 0
     var onNote: ((String) -> Void)?
 
     func start() {
@@ -2382,9 +2397,13 @@ final class SwitchSync {
         observer = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.noteActivation() }
-        let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.pollMC() }
-        RunLoop.main.add(t, forMode: .common)
-        mcTimer = t
+        // MCキーなどの特殊キーの足跡を取る(聞き専用タップ)
+        let sysMask = CGEventMask(1) << 14
+        if let tap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .listenOnly, eventsOfInterest: sysMask, callback: switchKeyCallback, userInfo: nil) {
+            let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+            CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
     }
 
     /// 一覧が開いている間にアプリが切り替わった = そこで確定した
@@ -2399,6 +2418,24 @@ final class SwitchSync {
         setFlag(true)
         broadcast("swopen")
         onNote?("Mission Control を検知: 合図を送りました")
+    }
+
+    /// Ctrl+↑ や MCキー: 開いていなければ「開いた」合図、開いているときは確定(トグルで閉じた)
+    func noteOpenKey() {
+        guard enabled else { return }
+        if switching { decide() } else { noteLocalOpen() }
+    }
+
+    /// トラックパッドの4本指縦スワイプ(Engine が検知): 上下とも一覧を開く操作。
+    /// 切り替え中の下スワイプは「閉じた=確定」として扱う
+    func noteGesture(up: Bool) {
+        guard enabled else { return }
+        NetLog.shared.log("MC検知: 4本指スワイプ (up=\(up))")
+        if switching {
+            if !up { decide() }
+        } else {
+            noteLocalOpen()
+        }
     }
 
     /// 自分が Esc で一覧を閉じた: 確定と同じ扱いで、他端末の一覧も閉じさせる
@@ -2429,41 +2466,6 @@ final class SwitchSync {
         setFlag(false)
         broadcast("swdone")
         onNote?("確定を送りました")
-    }
-
-    /// Mission Control / Exposé の開閉を検知する(ジェスチャやホットコーナーでも開くので、キーではなく画面を見る)
-    private func pollMC() {
-        guard enabled else { mcActive = false; mcOn = 0; mcOff = 0; return }
-        // 一瞬だけ出る Dock の窓を Mission Control と誤検知しないよう、
-        // 2回連続(約0.5秒)残った変化だけを本物とみなす(開くのも閉じるのも)
-        if missionControlActive() {
-            mcOn += 1; mcOff = 0
-        } else {
-            if mcOn == 1 { NetLog.shared.log("MC検知: 一瞬のドック窓を無視しました") }
-            mcOff += 1; mcOn = 0
-        }
-        let active = mcActive ? mcOff < 2 : mcOn >= 2
-        guard active != mcActive else { return }
-        mcActive = active
-        if active {
-            noteLocalOpen()
-        } else if switching {
-            decide()
-        }
-    }
-
-    /// Mission Control / Exposé が表示中かどうか。公式の判定方法は無いので、
-    /// Dock が画面全体サイズのウィンドウを出しているかで推定する
-    private func missionControlActive() -> Bool {
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
-        for w in list {
-            guard (w[kCGWindowOwnerName as String] as? String) == "Dock",
-                  let b = w[kCGWindowBounds as String] as? [String: Any],
-                  let sw = (b["Width"] as? NSNumber)?.doubleValue,
-                  let sh = (b["Height"] as? NSNumber)?.doubleValue else { continue }
-            for s in NSScreen.screens where sw >= Double(s.frame.width) * 0.9 && sh >= Double(s.frame.height) * 0.9 { return true }
-        }
-        return false
     }
 
     private func broadcast(_ kind: String) {

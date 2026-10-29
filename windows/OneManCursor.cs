@@ -40,7 +40,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-14";
+    private const string BuildTag = "Build 20261030-15";
 
     private static string SpecId(string spec)
     {
@@ -661,6 +661,7 @@ internal static class Program
     /// 合図を受けて自分のタスクビューを開く
     private static void OpenSwitchLocal()
     {
+        Log("切り替え連動: 合図でタスクビューを開きます");
         SetSwitching(true);
         SendInputs(MakeKey(0x5B, false), MakeKey(0x09, false), MakeKey(0x09, true), MakeKey(0x5B, true));
     }
@@ -669,6 +670,7 @@ internal static class Program
     private static void ReceiveDoneSwitch()
     {
         if (!SwitchAlive()) return;
+        Log("切り替え連動: 確定を受けて閉じます");
         switching = false;
         SendInputs(MakeKey(0x1B, false), MakeKey(0x1B, true));
     }
@@ -677,6 +679,7 @@ internal static class Program
     private static void DecideSwitch()
     {
         if (!SwitchAlive()) return;
+        Log("切り替え連動: 確定を送信");
         switching = false;
         SendSwitchAll("done");
     }
@@ -687,6 +690,7 @@ internal static class Program
         fgProc = FgCallback;
         kbHook = SetWindowsHookEx(13, kbProc, GetModuleHandle(null), 0);
         fgHook = SetWinEventHook(0x0003, 0x0003, IntPtr.Zero, fgProc, 0, 0, 0);
+        Log("切り替え連動: フック開始 kb=" + kbHook + " fg=" + fgHook);
     }
 
     private static IntPtr KbHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -704,12 +708,12 @@ internal static class Program
                     if ((GetAsyncKeyState(0x12) & 0x8000) != 0)
                     {
                         // Alt+Tab 開始: 一覧を開いた扱いにし、他端末へ「開く」合図(Alt を離すまで再送しない)
-                        if (!altTabArmed) { altTabArmed = true; SetSwitching(true); SendSwitchAll("open"); }
+                        if (!altTabArmed) { altTabArmed = true; Log("切り替え連動: Alt+Tab 開始"); SetSwitching(true); SendSwitchAll("open"); }
                     }
                     else if ((GetAsyncKeyState(0x5B) & 0x8000) != 0 || (GetAsyncKeyState(0x5C) & 0x8000) != 0)
                     {
                         // Win+Tab(タスクビュー)開始
-                        if (!winTabArmed) { winTabArmed = true; SetSwitching(true); SendSwitchAll("open"); }
+                        if (!winTabArmed) { winTabArmed = true; Log("切り替え連動: Win+Tab 開始"); SetSwitching(true); SendSwitchAll("open"); }
                     }
                 }
                 else if (up && (vk == 0x12 || vk == 0xA4 || vk == 0xA5))

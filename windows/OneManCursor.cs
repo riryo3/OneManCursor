@@ -40,7 +40,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-10";
+    private const string BuildTag = "Build 20261030-11";
 
     private static string SpecId(string spec)
     {
@@ -457,8 +457,26 @@ internal static class Program
         }
         else if (kind == "kd" || kind == "ku")
         {
-            int code;
-            if (args.Length < 2 || !int.TryParse(args[0], out code)) return;
+            int code; long flags;
+            if (args.Length < 2 || !int.TryParse(args[0], out code) || !long.TryParse(args[1], out flags)) return;
+            bool down = kind == "kd";
+            bool cmd = (flags & 0x100000L) != 0;
+            // ⌘[ / ⌘] は文字キーではなく、Windows のブラウザ「戻る/進む」専用キーへ割り振る
+            if (cmd && code == 33) { SendInputs(MakeKey(0xA6, !down)); return; }
+            if (cmd && code == 30) { SendInputs(MakeKey(0xA7, !down)); return; }
+            if (cmd && code == 126 && ForegroundKind() == Foreground.Explorer)
+            {
+                // エクスプローラーの「上の階層へ」= Alt+↑
+                if (down) SendInputs(MakeKey(0x12, false), MakeKey(0x26, false));
+                else SendInputs(MakeKey(0x26, true), MakeKey(0x12, true));
+                return;
+            }
+            if (cmd && code == 31 && ForegroundKind() == Foreground.Explorer)
+            {
+                // エクスプローラーの「開く」= Enter
+                SendInputs(MakeKey(0x0D, !down));
+                return;
+            }
             ushort vk;
             if (MacKeyToVK.TryGetValue(code, out vk)) SendInputs(MakeKey(vk, kind == "ku"));
         }

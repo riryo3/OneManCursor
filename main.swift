@@ -783,6 +783,7 @@ final class CursorShare {
         forwardTo = nil
         showCursor()
         stopPinning()
+        EdgeGlow.shared.hide()
     }
 
     private var frozenPoint: CGPoint?
@@ -922,6 +923,11 @@ final class CursorShare {
             return Unmanaged.passUnretained(event)
         }
         guard enabled else { return Unmanaged.passUnretained(event) }
+        // 手元にカーソルがあるときは、端への近さでボーダー表示を更新する
+        if enabled, !sending, !holding, forwardTo == nil,
+           type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged {
+            updateGlowAtHome(event.location)
+        }
         // 非常口は ⌘Esc。Esc 単体はよく使うキーなので、普通のキーとして相手へ送る
         let isEsc = type == .keyDown && event.getIntegerValueField(.keyboardEventKeycode) == 53 && event.flags.contains(.maskCommand)
 
@@ -981,6 +987,42 @@ final class CursorShare {
         LinkNet.sendFast("fl \(to) 55 0")
     }
 
+    /// 端から 56px 以内に入ったら、その方向の行き先をボーダーで示す(起点・手元のとき)
+    private func updateGlowAtHome(_ loc: CGPoint) {
+        let b = allBounds
+        let spots: [(PartnerDir, Double, Double)] = [
+            (.right, Double(b.maxX) - Double(loc.x), (Double(loc.y) - Double(b.minY)) / Double(b.height)),
+            (.left, Double(loc.x) - Double(b.minX), (Double(loc.y) - Double(b.minY)) / Double(b.height)),
+            (.down, Double(b.maxY) - Double(loc.y), (Double(loc.x) - Double(b.minX)) / Double(b.width)),
+            (.up, Double(loc.y) - Double(b.minY), (Double(loc.x) - Double(b.minX)) / Double(b.width)),
+        ]
+        for (dir, dist, ratio) in spots where dist <= 56 {
+            if let lk = link(dir: dir, at: ratio) {
+                EdgeGlow.shared.show(dir: dir, link: lk)
+                return
+            }
+        }
+        EdgeGlow.shared.hide()
+    }
+
+    /// 保持中: 仮想カーソルの端への近さでボーダーを示す
+    private func updateGlowHolding() {
+        let b = allBounds
+        let spots: [(PartnerDir, Double, Double)] = [
+            (.right, Double(b.maxX) - vx, (vy - Double(b.minY)) / Double(b.height)),
+            (.left, vx - Double(b.minX), (vy - Double(b.minY)) / Double(b.height)),
+            (.down, Double(b.maxY) - vy, (vx - Double(b.minX)) / Double(b.width)),
+            (.up, vy - Double(b.minY), (vx - Double(b.minX)) / Double(b.width)),
+        ]
+        for (dir, dist, ratio) in spots where dist <= 56 {
+            if let lk = link(dir: dir, at: ratio) {
+                EdgeGlow.shared.show(dir: dir, link: lk)
+                return
+            }
+        }
+        EdgeGlow.shared.hide()
+    }
+
     /// 端に触れていたら相手に渡す。渡したら true
     /// 押し込み量が設定されているときは、端に張り付いたまま外向きに押し込んだ
     /// 合計がその量に達するまで渡さない(端でのバタつき防止にもなる)
@@ -1012,6 +1054,7 @@ final class CursorShare {
             for _ in 0..<3 { LinkNet.sendFast("enter \(lk.id) \(seg) \(dir.rawValue)") }
             hideCursor()
             startPinning(at: loc)
+            EdgeGlow.shared.hide()
             status("カーソル共有： \(peerName(lk.id)) に渡しました")
             return true
         }
@@ -1123,6 +1166,11 @@ final class CursorShare {
             // レイアウトの割り当て: リンク表を丸ごと差し替える
             var newLinks: [PeerLink] = []
             for tok in rest {
+                if tok.hasPrefix("c:") {
+                    let kv = tok.dropFirst(2).split(separator: "=", maxSplits: 1)
+                    if kv.count == 2 { setMachineColorHex(String(kv[0]), String(kv[1])) }
+                    continue
+                }
                 let kv = tok.split(separator: "=", maxSplits: 1)
                 guard kv.count == 2, let d = PartnerDir(rawValue: String(kv[0])),
                       let lk = Self.parseLink(dir: d, spec: String(kv[1])) else { continue }
@@ -1169,6 +1217,7 @@ final class CursorShare {
             holding = false
             status("カーソル共有： \(peerName(next)) へ渡しました")
         }
+        EdgeGlow.shared.hide()
         return true
     }
 
@@ -1212,6 +1261,7 @@ final class CursorShare {
             }
             vx = min(max(vx, Double(b.minX)), Double(b.maxX) - 1)
             vy = min(max(vy, Double(b.minY)), Double(b.maxY) - 1)
+            updateGlowHolding()
             postMoveThrottled()
         case "dn", "up":
             guard let n = args.first.flatMap({ Int($0) }) else { return }
@@ -1353,6 +1403,152 @@ final class Multitouch {
 }
 
 
+
+// MARK: - マシンの色と端のボーダー表示
+
+/// "#RRGGBB" から NSColor を作る
+func colorFromHex(_ hex: String) -> NSColor {
+    var s = hex
+    if s.hasPrefix("#") { s.removeFirst() }
+    guard s.count == 6, let v = UInt32(s, radix: 16) else { return .systemBlue }
+    return NSColor(red: CGFloat((v >> 16) & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255, blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+}
+
+func hexFromColor(_ c: NSColor) -> String {
+    let rgb = c.usingColorSpace(.sRGB) ?? c
+    return String(format: "#%02X%02X%02X", Int((rgb.redComponent * 255).rounded()), Int((rgb.greenComponent * 255).rounded()), Int((rgb.blueComponent * 255).rounded()))
+}
+
+/// マシンの色: 設定済みならそれ、無ければ ID から安定して決まる色
+func machineColorHex(of id: String) -> String {
+    let map = UserDefaults.standard.dictionary(forKey: "machineColors") as? [String: String] ?? [:]
+    if let hex = map[id] { return hex }
+    var h: UInt64 = 5381
+    for u in id.unicodeScalars { h = h &* 33 &+ UInt64(u.value) }
+    let hue = Double(h % 360) / 360.0
+    return hexFromColor(NSColor(hue: CGFloat(hue), saturation: 0.65, brightness: 0.95, alpha: 1))
+}
+
+func setMachineColorHex(_ id: String, _ hex: String) {
+    var map = UserDefaults.standard.dictionary(forKey: "machineColors") as? [String: String] ?? [:]
+    map[id] = hex
+    UserDefaults.standard.set(map, forKey: "machineColors")
+}
+
+/// 端に近づいたとき、行き先のマシンの色で画面の輪郭を光らせる表示。
+/// 行き先の区間を強く光らせるので、色の切れ目が隣同士の境界になる
+final class EdgeGlow {
+    static let shared = EdgeGlow()
+    private var window: NSWindow?
+    private var view: EdgeGlowView?
+    private var timer: Timer?
+    fileprivate var alpha = 0.0
+    private var targetAlpha = 0.0
+    fileprivate var dir: PartnerDir = .right
+    fileprivate var color: NSColor = .systemBlue
+    fileprivate var segStart = 0.0
+    fileprivate var segEnd = 1.0
+
+    func show(dir: PartnerDir, link lk: PeerLink) {
+        let c = colorFromHex(machineColorHex(of: lk.id))
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.ensureWindow()
+            self.dir = dir
+            self.color = c
+            self.segStart = lk.start
+            self.segEnd = lk.end
+            self.targetAlpha = 1
+            self.startTimer()
+        }
+    }
+
+    func hide() {
+        DispatchQueue.main.async { [weak self] in
+            self?.targetAlpha = 0
+            self?.startTimer()
+        }
+    }
+
+    private func ensureWindow() {
+        if window != nil { return }
+        let union = NSScreen.screens.reduce(NSRect.zero) { $0.union($1.frame) }
+        let v = EdgeGlowView(frame: NSRect(origin: .zero, size: union.size))
+        v.owner = self
+        let w = NSWindow(contentRect: union, styleMask: [.borderless], backing: .buffered, defer: false)
+        w.contentView = v
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = false
+        w.ignoresMouseEvents = true
+        w.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.overlayWindow)))
+        w.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        window = w
+        view = v
+    }
+
+    private func startTimer() {
+        if timer != nil { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let diff = self.targetAlpha - self.alpha
+            self.alpha = abs(diff) < 0.04 ? self.targetAlpha : self.alpha + diff * 0.35
+            if self.alpha <= 0.01 && self.targetAlpha == 0 {
+                self.window?.orderOut(nil)
+                self.timer?.invalidate()
+                self.timer = nil
+                return
+            }
+            self.window?.orderFrontRegardless()
+            self.view?.needsDisplay = true
+        }
+    }
+}
+
+final class EdgeGlowView: NSView {
+    weak var owner: EdgeGlow?
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let o = owner, o.alpha > 0.01 else { return }
+        let a = CGFloat(o.alpha)
+        let col = o.color
+        // 輪郭全体をうっすら
+        let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: 3, dy: 3), xRadius: 14, yRadius: 14)
+        col.withAlphaComponent(0.30 * a).setStroke()
+        outline.lineWidth = 4
+        outline.stroke()
+        // 行き先の区間を強く(影でぼかす)
+        let w = Double(bounds.width), h = Double(bounds.height)
+        let s = o.segStart, e = o.segEnd
+        let seg = NSBezierPath()
+        switch o.dir {
+        case .right:
+            seg.move(to: NSPoint(x: w - 4, y: h * (1 - s)))
+            seg.line(to: NSPoint(x: w - 4, y: h * (1 - e)))
+        case .left:
+            seg.move(to: NSPoint(x: 4, y: h * (1 - s)))
+            seg.line(to: NSPoint(x: 4, y: h * (1 - e)))
+        case .down:
+            seg.move(to: NSPoint(x: w * s, y: 4))
+            seg.line(to: NSPoint(x: w * e, y: 4))
+        case .up:
+            seg.move(to: NSPoint(x: w * s, y: h - 4))
+            seg.line(to: NSPoint(x: w * e, y: h - 4))
+        }
+        let shadow = NSShadow()
+        shadow.shadowColor = col.withAlphaComponent(0.9 * a)
+        shadow.shadowBlurRadius = 12
+        shadow.shadowOffset = .zero
+        NSGraphicsContext.saveGraphicsState()
+        shadow.set()
+        col.withAlphaComponent(0.95 * a).setStroke()
+        seg.lineWidth = 5
+        seg.lineCapStyle = .round
+        seg.stroke()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+}
+
 // MARK: - レイアウト配置
 
 /// 配置(マシンID → 原点)と、そこから導く隣接リンク、割り当ての送信を担当する
@@ -1460,11 +1656,12 @@ enum LayoutStore {
     }
 
     static func sendAssign(to id: String, links: [PeerLink]) {
-        if links.isEmpty {
-            LinkNet.sendFast("assign \(id) none")
-        } else {
-            LinkNet.sendFast("assign \(id) " + links.map { "\($0.dir.rawValue)=\($0.spec)" }.joined(separator: " "))
+        var tokens = links.isEmpty ? ["none"] : links.map { "\($0.dir.rawValue)=\($0.spec)" }
+        // 色の対応表も一緒に配る(端のボーダー表示で使う)
+        for cid in loadPos().keys {
+            tokens.append("c:\(cid)=\(machineColorHex(of: cid))")
         }
+        LinkNet.sendFast("assign \(id) " + tokens.joined(separator: " "))
         lastAssign[id] = Date()
     }
 
@@ -1497,6 +1694,7 @@ final class LayoutCanvasView: NSView {
     private var curScene = CGRect.zero
     private var curK: CGFloat = 0.15
     private var timer: Timer?
+    private var swatches: [String: NSRect] = [:]
 
     private var trayHeight: CGFloat { 96 }
 
@@ -1562,10 +1760,35 @@ final class LayoutCanvasView: NSView {
         return NSRect(x: x, y: y, width: tw, height: th)
     }
 
+    // MARK: 色の変更
+    private var colorTarget: String?
+
+    private func pickColor(for id: String) {
+        colorTarget = id
+        let panel = NSColorPanel.shared
+        panel.setTarget(self)
+        panel.setAction(#selector(colorPicked(_:)))
+        panel.color = colorFromHex(machineColorHex(of: id))
+        panel.isContinuous = false
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func colorPicked(_ sender: NSColorPanel) {
+        guard let id = colorTarget else { return }
+        setMachineColorHex(id, hexFromColor(sender.color))
+        LayoutStore.apply(pos: LayoutStore.loadPos())
+        needsDisplay = true
+    }
+
     // MARK: ドラッグ
     override func mouseDown(with event: NSEvent) {
         freezeTransform()
         let p = convert(event.locationInWindow, from: nil)
+        for (id, r) in swatches where r.contains(p) {
+            pickColor(for: id)
+            return
+        }
         for (id, r) in LayoutStore.rects(pos: pos) {
             if toView(r).contains(p) {
                 dragID = id
@@ -1696,9 +1919,19 @@ final class LayoutCanvasView: NSView {
         let online = isSelf || (LinkNet.peers[id].map { Date().timeIntervalSince($0.seen) < 120 } ?? false)
         (online ? NSColor.textBackgroundColor : NSColor.textBackgroundColor.withAlphaComponent(0.4)).setFill()
         path.fill()
-        (isSelf ? NSColor.controlAccentColor : NSColor.separatorColor).setStroke()
-        path.lineWidth = (isSelf ? 2.5 : 1.5) + (dragging ? 1.5 : 0)
+        let mcol = colorFromHex(machineColorHex(of: id))
+        mcol.setStroke()
+        path.lineWidth = (isSelf ? 3 : 2.5) + (dragging ? 1.5 : 0)
         path.stroke()
+        // 右上の色チップ(クリックで色を変更)
+        let chip = NSRect(x: viewRect.maxX - 21, y: viewRect.maxY - 21, width: 15, height: 15)
+        let chipPath = NSBezierPath(ovalIn: chip)
+        mcol.setFill()
+        chipPath.fill()
+        NSColor.white.setStroke()
+        chipPath.lineWidth = 2
+        chipPath.stroke()
+        swatches[id] = chip
         let name = LayoutStore.name(of: id) + (isSelf ? "（自分）" : "")
         let s = LayoutStore.size(of: id)
         let sub = "\(Int(s.w))×\(Int(s.h))" + (online ? "" : "・応答なし")
@@ -1725,7 +1958,7 @@ final class LayoutWindowController: NSWindowController {
         canvas.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let snapBox = NSButton(checkboxWithTitle: "スナップ（辺・上辺・下辺・中央に吸着）", target: self, action: #selector(toggleSnap(_:)))
         snapBox.state = canvas.snapEnabled ? .on : .off
-        let hint = NSTextField(labelWithString: "辺がくっついた相手が「隣」になります。配置は全マシンへ自動で配られます")
+        let hint = NSTextField(labelWithString: "辺がくっつくと隣になります。タイル右上の丸で、そのマシンの色を変更できます")
         hint.textColor = .secondaryLabelColor
         hint.font = .systemFont(ofSize: 11)
         let bar = NSStackView(views: [snapBox, hint])

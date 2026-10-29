@@ -37,6 +37,8 @@ internal static class Program
         public string Id { get { return SpecId(Spec); } }
     }
     private static readonly List<PeerLinkC> links = new List<PeerLinkC>();
+    // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
+    private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
 
     private static string SpecId(string spec)
     {
@@ -284,6 +286,15 @@ internal static class Program
             }
         }
         string pv;
+        string cv;
+        if (kv.TryGetValue("colors", out cv) && cv.Length > 0)
+        {
+            foreach (string tok in cv.Split(';'))
+            {
+                int eq = tok.IndexOf('=');
+                if (eq > 0) colorMap[tok.Substring(0, eq)] = tok.Substring(eq + 1);
+            }
+        }
         if (kv.TryGetValue("push", out pv)) int.TryParse(pv, out pushPx);
         string cv;
         clipEnabled = kv.TryGetValue("clip", out cv) && cv == "1";
@@ -311,6 +322,7 @@ internal static class Program
             sb.AppendLine("name=" + (configKv.TryGetValue("name", out v) ? v : ""));
             sb.AppendLine("id=" + myId);
             sb.AppendLine("links=" + (configKv.TryGetValue("links", out v) ? v : ""));
+            sb.AppendLine("colors=" + (configKv.TryGetValue("colors", out v) ? v : ""));
             sb.AppendLine("push=" + (configKv.TryGetValue("push", out v) ? v : ""));
             sb.AppendLine("clip=" + (configKv.TryGetValue("clip", out v) ? v : ""));
             File.WriteAllText(path, sb.ToString());
@@ -464,8 +476,16 @@ internal static class Program
     private static void HandleAssign(string[] args)
     {
         links.Clear();
+        Dictionary<string, string> newColors = new Dictionary<string, string>();
         foreach (string t in args)
         {
+            if (t.StartsWith("c:"))
+            {
+                string kv = t.Substring(2);
+                int ceq = kv.IndexOf('=');
+                if (ceq > 0) newColors[kv.Substring(0, ceq)] = kv.Substring(ceq + 1);
+                continue;
+            }
             int eq = t.IndexOf('=');
             if (eq <= 0) continue;
             string d = t.Substring(0, eq);
@@ -474,6 +494,13 @@ internal static class Program
             l.Dir = d;
             l.Spec = t.Substring(eq + 1);
             if (l.Spec.Length > 0) links.Add(l);
+        }
+        if (newColors.Count > 0)
+        {
+            colorMap = newColors;
+            List<string> cparts = new List<string>();
+            foreach (KeyValuePair<string, string> p in colorMap) cparts.Add(p.Key + "=" + p.Value);
+            configKv["colors"] = string.Join(";", cparts.ToArray());
         }
         SaveConfig();
         Log("レイアウト: 割り当てを受けました");

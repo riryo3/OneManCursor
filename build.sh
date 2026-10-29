@@ -33,3 +33,19 @@ else
     codesign --force --deep --sign - "$APP"
 fi
 echo "できた: $APP"
+
+# 配布用: sh build.sh dist
+# 自分用の署名(証明書名に Apple ID のメアドが入る)をはがして場当たり署名に付け替え、
+# 配布用 zip を作る。自分用の $APP はそのまま残る
+if [ "$1" = "dist" ]; then
+    rm -rf dist
+    mkdir -p dist
+    cp -R "$APP" "dist/$APP"
+    codesign --force --deep --sign - "dist/$APP"
+    if codesign -dv "dist/$APP" 2>&1 | grep -q "Apple Development"; then
+        echo "エラー: 配布用アプリに Apple Development 署名が残っています"
+        exit 1
+    fi
+    (cd dist && ditto -c -k --keepParent "$APP" "OneManCursor.zip")
+    echo "配布用できた: dist/OneManCursor.zip（署名は場当たり署名に付け替え済み）"
+fi

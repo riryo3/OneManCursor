@@ -610,6 +610,18 @@ final class CursorShare {
     private var forwardTo: String?   // 中継中: さらに先の相手
     private var vx: Double = 0, vy: Double = 0
 
+    // 画面移動の調整(メニュー「画面移動の調整」で変更)
+    /// 端の押し込み量(px)。0 = 端に触れたら即移動
+    static var pushPx: Int { UserDefaults.standard.integer(forKey: "edgePushPx") }
+    /// 起点が送るカーソル移動の倍率。未設定(0)なら 1
+    static var moveMult: Double {
+        let v = UserDefaults.standard.double(forKey: "moveMult")
+        return v == 0 ? 1 : v
+    }
+    private var edgePush: [PartnerDir: Double] = [:]   // 起点側: 端への押し込み累積
+    private var holdPush: [PartnerDir: Double] = [:]   // 保持側: 端への押し込み累積
+    private var multAccX = 0.0, multAccY = 0.0         // 倍率の端数を持ち越す
+
     private init() {
         for dir in [PartnerDir.right, .left, .up, .down] {
             if let id = UserDefaults.standard.string(forKey: "neighbor_" + dir.rawValue) {
@@ -868,19 +880,31 @@ final class CursorShare {
     }
 
     /// 端に触れていたら相手に渡す。渡したら true
+    /// 押し込み量が設定されているときは、端に張り付いたまま外向きに押し込んだ
+    /// 合計がその量に達するまで渡さない(端でのバタつき防止にもなる)
     private func checkEdges(_ event: CGEvent) -> Bool {
         let b = allBounds
         let loc = event.location
-        let checks: [(PartnerDir, Bool, Double)] = [
-            (.right, loc.x >= b.maxX - 1, Double((loc.y - b.minY) / b.height)),
-            (.left, loc.x <= b.minX, Double((loc.y - b.minY) / b.height)),
-            (.down, loc.y >= b.maxY - 1, Double((loc.x - b.minX) / b.width)),
-            (.up, loc.y <= b.minY, Double((loc.x - b.minX) / b.width)),
+        let dx = Double(event.getIntegerValueField(.mouseEventDeltaX))
+        let dy = Double(event.getIntegerValueField(.mouseEventDeltaY))
+        let push = Double(Self.pushPx)
+        let checks: [(PartnerDir, Bool, Double, Double)] = [
+            (.right, loc.x >= b.maxX - 1, Double((loc.y - b.minY) / b.height), dx),
+            (.left, loc.x <= b.minX, Double((loc.y - b.minY) / b.height), -dx),
+            (.down, loc.y >= b.maxY - 1, Double((loc.x - b.minX) / b.width), dy),
+            (.up, loc.y <= b.minY, Double((loc.x - b.minX) / b.width), -dy),
         ]
-        for (dir, hit, ratio) in checks where hit {
+        for (dir, hit, ratio, outward) in checks {
+            if !hit { edgePush[dir] = 0; continue }
             guard let next = neighbors[dir] else { continue }
+            if push > 0 {
+                edgePush[dir, default: 0] += max(0, outward)
+                if edgePush[dir, default: 0] < push { continue }
+            }
             sending = true
             awayTo = next
+            edgePush.removeAll()
+            multAccX = 0; multAccY = 0
             for _ in 0..<3 { LinkNet.sendFast("enter \(next) \(ratio) \(dir.rawValue)") }
             hideCursor()
             startPinning(at: loc)
@@ -896,7 +920,19 @@ final class CursorShare {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             let dx = event.getIntegerValueField(.mouseEventDeltaX)
             let dy = event.getIntegerValueField(.mouseEventDeltaY)
-            if dx != 0 || dy != 0 { LinkNet.sendFast("mv \(to) \(dx) \(dy)") }
+            let mult = Self.moveMult
+            if mult == 1 {
+                if dx != 0 || dy != 0 { LinkNet.sendFast("mv \(to) \(dx) \(dy)") }
+            } else {
+                // 倍率をかけ、端数は持ち越す(ゆっくり動かした分が消えないように)
+                multAccX += Double(dx) * mult
+                multAccY += Double(dy) * mult
+                let sx = Int(multAccX.rounded())
+                let sy = Int(multAccY.rounded())
+                multAccX -= Double(sx)
+                multAccY -= Double(sy)
+                if sx != 0 || sy != 0 { LinkNet.sendFast("mv \(to) \(sx) \(sy)") }
+            }
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             LinkNet.sendFast("dn \(to) \(event.getIntegerValueField(.mouseEventButtonNumber))")
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
@@ -999,10 +1035,35 @@ final class CursorShare {
             vy += dy
             let ry = (vy - Double(b.minY)) / Double(b.height)
             let rx = (vx - Double(b.minX)) / Double(b.width)
-            if vx >= Double(b.maxX), cross(.right, ratio: ry) { return }
-            if vx < Double(b.minX), cross(.left, ratio: ry) { return }
-            if vy >= Double(b.maxY), cross(.down, ratio: rx) { return }
-            if vy < Double(b.minY), cross(.up, ratio: rx) { return }
+            let push = Double(Self.pushPx)
+            if push <= 0 {
+                if vx >= Double(b.maxX), cross(.right, ratio: ry) { return }
+                if vx < Double(b.minX), cross(.left, ratio: ry) { return }
+                if vy >= Double(b.maxY), cross(.down, ratio: rx) { return }
+                if vy < Double(b.minY), cross(.up, ratio: rx) { return }
+            } else {
+                // 端に張り付いたまま押し込んだ量が設定値に達したら渡す
+                if vx >= Double(b.maxX) {
+                    holdPush[.right, default: 0] += vx - (Double(b.maxX) - 1)
+                    vx = Double(b.maxX) - 1
+                    if holdPush[.right, default: 0] >= push { holdPush.removeAll(); if cross(.right, ratio: ry) { return } }
+                } else { holdPush[.right] = 0 }
+                if vx < Double(b.minX) {
+                    holdPush[.left, default: 0] += Double(b.minX) - vx
+                    vx = Double(b.minX)
+                    if holdPush[.left, default: 0] >= push { holdPush.removeAll(); if cross(.left, ratio: ry) { return } }
+                } else { holdPush[.left] = 0 }
+                if vy >= Double(b.maxY) {
+                    holdPush[.down, default: 0] += vy - (Double(b.maxY) - 1)
+                    vy = Double(b.maxY) - 1
+                    if holdPush[.down, default: 0] >= push { holdPush.removeAll(); if cross(.down, ratio: rx) { return } }
+                } else { holdPush[.down] = 0 }
+                if vy < Double(b.minY) {
+                    holdPush[.up, default: 0] += Double(b.minY) - vy
+                    vy = Double(b.minY)
+                    if holdPush[.up, default: 0] >= push { holdPush.removeAll(); if cross(.up, ratio: rx) { return } }
+                } else { holdPush[.up] = 0 }
+            }
             vx = min(max(vx, Double(b.minX)), Double(b.maxX) - 1)
             vy = min(max(vy, Double(b.minY)), Double(b.maxY) - 1)
             postMoveThrottled()
@@ -1177,6 +1238,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastItem: NSMenuItem!
     var mtItem: NSMenuItem!
     var statsItem: NSMenuItem!
+    var diagItem: NSMenuItem!
+    var pushItems: [NSMenuItem] = []
+    var multItems: [NSMenuItem] = []
+    var loginItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
         migrateDefaultsIfNeeded()
@@ -1197,20 +1262,47 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         layoutParent.submenu = layoutMenu
         tapItem = NSMenuItem(title: "キー送信をセッション方式にする", action: #selector(toggleTap), keyEquivalent: "")
         tapItem.target = self
+        let moveParent = NSMenuItem(title: "画面移動の調整", action: nil, keyEquivalent: "")
+        let moveMenu = NSMenu()
+        let pushParent = NSMenuItem(title: "端の押し込み量", action: nil, keyEquivalent: "")
+        let pushMenu = NSMenu()
+        pushItems = []
+        for px in [0, 10, 20, 40, 80] {
+            let pi = NSMenuItem(title: px == 0 ? "なし（触れたら即）" : "\(px) px", action: #selector(pickPush(_:)), keyEquivalent: "")
+            pi.target = self
+            pi.tag = px
+            pushMenu.addItem(pi)
+            pushItems.append(pi)
+        }
+        pushParent.submenu = pushMenu
+        let multParent = NSMenuItem(title: "移動の倍率", action: nil, keyEquivalent: "")
+        let multMenu = NSMenu()
+        multItems = []
+        for m in [50, 75, 100, 125, 150, 200] {
+            let mi = NSMenuItem(title: String(format: "%.2f 倍", Double(m) / 100), action: #selector(pickMult(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.tag = m
+            multMenu.addItem(mi)
+            multItems.append(mi)
+        }
+        multParent.submenu = multMenu
+        moveMenu.addItem(pushParent)
+        moveMenu.addItem(multParent)
+        moveParent.submenu = moveMenu
         lastItem = NSMenuItem(title: "最後の検出： なし", action: nil, keyEquivalent: "")
         lastItem.isEnabled = false
         mtItem = NSMenuItem(title: "トラックパッド： —", action: nil, keyEquivalent: "")
         mtItem.isEnabled = false
         statsItem = NSMenuItem(title: "受信： 0フレーム / 最大0本", action: nil, keyEquivalent: "")
         statsItem.isEnabled = false
+        diagItem = NSMenuItem(title: "状態の詳細を表示", action: #selector(toggleDiag), keyEquivalent: "")
+        diagItem.target = self
         let permItem = NSMenuItem(title: "アクセシビリティ許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self
-        let inputReqItem = NSMenuItem(title: "入力監視の許可を求める", action: #selector(requestInputAccess), keyEquivalent: "")
-        inputReqItem.target = self
-        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(layoutParent); menu.addItem(tapItem); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(.separator())
-        menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(inputReqItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(tapItem); menu.addItem(layoutParent); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
+        menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
         cursorShowItem = NSMenuItem(title: "カーソルを大きく表示", action: #selector(toggleCursorShow), keyEquivalent: "")
         cursorShowItem.target = self
         let shapeParent = NSMenuItem(title: "カーソルの形", action: nil, keyEquivalent: "")
@@ -1226,10 +1318,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         shapeParent.submenu = shapeMenu
         let cursorSettingsItem = NSMenuItem(title: "カーソル表示の設定…", action: #selector(openCursorSettings), keyEquivalent: "")
         cursorSettingsItem.target = self
-        menu.addItem(cursorShowItem); menu.addItem(shapeParent); menu.addItem(cursorSettingsItem); menu.addItem(.separator())
+        loginItem = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLogin), keyEquivalent: "")
+        loginItem.target = self
+        menu.addItem(cursorShowItem); menu.addItem(shapeParent); menu.addItem(cursorSettingsItem); menu.addItem(loginItem); menu.addItem(.separator())
         menu.delegate = self
         menu.addItem(withTitle: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
+        applyDiagVisibility()
         refreshMenu()
 
         Engine.shared.onAction = { [weak self] label in
@@ -1310,6 +1405,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         linkItem.state = Engine.shared.linkMode ? .on : .off
         cursorItem.state = CursorShare.shared.enabled ? .on : .off
         tapItem.state = Engine.shared.keyTapSession ? .on : .off
+        diagItem.state = UserDefaults.standard.bool(forKey: "showDiag") ? .on : .off
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        for it in pushItems { it.state = it.tag == CursorShare.pushPx ? .on : .off }
+        for it in multItems { it.state = it.tag == Int((CursorShare.moveMult * 100).rounded()) ? .on : .off }
     }
 
     var flashRestore: DispatchWorkItem?
@@ -1395,6 +1494,41 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if raw != "none", let d = PartnerDir(rawValue: raw) {
             CursorShare.shared.setNeighbor(d, id: id)
         }
+    }
+
+    @objc func toggleLogin() {
+        do {
+            if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
+            else { try SMAppService.mainApp.register() }
+        } catch {
+            alert("ログイン項目を変更できませんでした", error.localizedDescription)
+        }
+        refreshMenu()
+    }
+
+    @objc func pickPush(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(sender.tag, forKey: "edgePushPx")
+        refreshMenu()
+    }
+
+    @objc func pickMult(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(Double(sender.tag) / 100, forKey: "moveMult")
+        refreshMenu()
+    }
+
+    @objc func toggleDiag() {
+        let v = !UserDefaults.standard.bool(forKey: "showDiag")
+        UserDefaults.standard.set(v, forKey: "showDiag")
+        applyDiagVisibility()
+        refreshMenu()
+    }
+
+    /// 最後の検出・トラックパッド・受信数の3行は診断用。普段は隠しておけるようにする
+    private func applyDiagVisibility() {
+        let v = UserDefaults.standard.bool(forKey: "showDiag")
+        lastItem.isHidden = !v
+        mtItem.isHidden = !v
+        statsItem.isHidden = !v
     }
 
     @objc func toggleTap() {

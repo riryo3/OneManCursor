@@ -7,7 +7,7 @@
 //  2) カーソル共有の参加者 → 合図でカーソルを受け取り、自分の画面で再現する。
 //     隣がいる端を越えたら次の相手へ中継し、来た相手の側の端を越えたら返す。
 // 設定は OneManCursor.ini (この exe と同じフォルダ) に書く:
-//   name=表示名 / left=左隣のID / right=右隣のID / up= / down= / id=自分のID(自動生成)
+//   name=表示名 / left=左隣のID / right=右隣のID / up= / down= / id=自分のID(自動生成) / push=端の押し込み量(px、0=即時)
 
 using System;
 using System.Collections.Generic;
@@ -42,6 +42,8 @@ internal static class Program
     private static string cameFrom = null;
     private static string forwardTo = null;
     private static double vx = 0, vy = 0;
+    private static int pushPx = 0;
+    private static double pushAccR = 0, pushAccL = 0, pushAccD = 0, pushAccU = 0;
 
     // ---- user32 ----
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
@@ -197,6 +199,8 @@ internal static class Program
             string v;
             if (kv.TryGetValue(d, out v) && v.Length > 0) neighbor[d] = v;
         }
+        string pv;
+        if (kv.TryGetValue("push", out pv)) int.TryParse(pv, out pushPx);
     }
 
     private static string OppositeDir(string d)
@@ -260,6 +264,8 @@ internal static class Program
 
     private static void Warp() { SetCursorPos((int)vx, (int)vy); }
 
+    private static void ClearPush() { pushAccR = 0; pushAccL = 0; pushAccD = 0; pushAccU = 0; }
+
     private static bool Cross(string dir, double ratio)
     {
         string next;
@@ -290,10 +296,25 @@ internal static class Program
             vx += dx; vy += dy;
             double ry = (vy - ScrY) / ScrH;
             double rx = (vx - ScrX) / ScrW;
-            if (vx >= ScrX + ScrW && Cross("right", ry)) return;
-            if (vx < ScrX && Cross("left", ry)) return;
-            if (vy >= ScrY + ScrH && Cross("down", rx)) return;
-            if (vy < ScrY && Cross("up", rx)) return;
+            if (pushPx <= 0)
+            {
+                if (vx >= ScrX + ScrW && Cross("right", ry)) return;
+                if (vx < ScrX && Cross("left", ry)) return;
+                if (vy >= ScrY + ScrH && Cross("down", rx)) return;
+                if (vy < ScrY && Cross("up", rx)) return;
+            }
+            else
+            {
+                // 端に張り付いたまま押し込んだ量が push= の値に達したら渡す
+                if (vx >= ScrX + ScrW) { pushAccR += vx - (ScrX + ScrW - 1); vx = ScrX + ScrW - 1; if (pushAccR >= pushPx) { ClearPush(); if (Cross("right", ry)) return; } }
+                else pushAccR = 0;
+                if (vx < ScrX) { pushAccL += ScrX - vx; vx = ScrX; if (pushAccL >= pushPx) { ClearPush(); if (Cross("left", ry)) return; } }
+                else pushAccL = 0;
+                if (vy >= ScrY + ScrH) { pushAccD += vy - (ScrY + ScrH - 1); vy = ScrY + ScrH - 1; if (pushAccD >= pushPx) { ClearPush(); if (Cross("down", rx)) return; } }
+                else pushAccD = 0;
+                if (vy < ScrY) { pushAccU += ScrY - vy; vy = ScrY; if (pushAccU >= pushPx) { ClearPush(); if (Cross("up", rx)) return; } }
+                else pushAccU = 0;
+            }
             if (vx < ScrX) vx = ScrX;
             if (vx > ScrX + ScrW - 1) vx = ScrX + ScrW - 1;
             if (vy < ScrY) vy = ScrY;

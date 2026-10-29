@@ -39,6 +39,8 @@ internal static class Program
     private static readonly List<PeerLinkC> links = new List<PeerLinkC>();
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
+    // ビルド番号(版の確認用。機能を変えたら上げる)
+    private const string BuildTag = "Build 20261030-9";
 
     private static string SpecId(string spec)
     {
@@ -764,6 +766,7 @@ internal static class Program
         {
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add("ログを表示", null, delegate { ShowLogWindow(); });
+            menu.Items.Add(BuildTag, null, null).Enabled = false;
             menu.Items.Add("自分の ID: " + myId, null, null).Enabled = false;
             ToolStripMenuItem clipItem = new ToolStripMenuItem("クリップボード共有");
             clipItem.Checked = clipEnabled;
@@ -779,7 +782,7 @@ internal static class Program
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("終了", null, delegate { Exit(); });
             icon = new NotifyIcon();
-            icon.Text = "ワンマンカーソル (ID: " + myId + ")";
+            icon.Text = "ワンマンカーソル " + BuildTag + " (ID: " + myId + ")";
             icon.Icon = MakeWaIcon();
             icon.ContextMenuStrip = menu;
             icon.Visible = true;

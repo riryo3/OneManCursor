@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-18"
+let buildTag = "Build 20261030-19"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1229,9 +1229,9 @@ final class CursorShare {
         case "srch":
             SearchSync.shared.receiveOpen()
         case "stext":
-            if parts.count >= 3 { SearchSync.shared.receiveText(parts[2]) }
+            if let b64 = rest.first { SearchSync.shared.receiveText(b64) }
         case "skey":
-            if parts.count >= 3 { SearchSync.shared.receiveKey(parts[2]) }
+            if let k = rest.first { SearchSync.shared.receiveKey(k) }
         case "sdone":
             SearchSync.shared.receiveDone()
         case "identify":

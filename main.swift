@@ -221,6 +221,8 @@ enum LinkNet {
 
     /// 発見した相方(id → 名前・IP・最終確認時刻)
     private(set) static var peers: [String: (name: String, ip: String, seen: Date)] = [:]
+    /// 相手の画面サイズ(hello で申告される。レイアウト編集のタイル比率に使う)
+    static var peerSizes: [String: (w: Int, h: Int)] = [:]
 
     // TCP 直結(到達と順序が保証されるので、キーの欠け対策の本命)
     static let tcpPort: UInt16 = 45988
@@ -267,7 +269,10 @@ enum LinkNet {
 
     private static func hello() {
         let name = Host.current().localizedName ?? "Mac"
-        udpSend(magic + "\(machineID) 0 hello \(name)")
+        let union = NSScreen.screens.reduce(NSRect.zero) { $0.union($1.frame) }
+        let w = union.width > 0 ? Int(union.width) : 1920
+        let h = union.height > 0 ? Int(union.height) : 1080
+        udpSend(magic + "\(machineID) 0 hello \(name) \(w)x\(h)")
     }
 
     /// カーソル共有セッションの全体リセット
@@ -437,8 +442,25 @@ enum LinkNet {
         guard parts.count >= 3, String(parts[0]) != machineID, let seq = UInt64(parts[1]) else { return }
         let kind = String(parts[2])
         if kind == "hello" {
-            let name = parts.dropFirst(3).joined(separator: " ")
-            peers[String(parts[0])] = (name.isEmpty ? "Mac" : name, ip, Date())
+            var tokens = parts.dropFirst(3).map { String($0) }
+            // 末尾の解像度トークン(例 2560x1440)は名前ではないので分ける
+            if let last = tokens.last {
+                let wh = last.split(separator: "x")
+                if wh.count == 2, let w = Int(wh[0]), let h = Int(wh[1]) {
+                    peerSizes[String(parts[0])] = (w, h)
+                    tokens.removeLast()
+                }
+            }
+            let name = tokens.joined(separator: " ")
+            let dispName = name.isEmpty ? "Mac" : name
+            let prev = peers[String(parts[0])]?.seen
+            peers[String(parts[0])] = (dispName, ip, Date())
+            var names = UserDefaults.standard.dictionary(forKey: "layoutNames") as? [String: String] ?? [:]
+            if names[String(parts[0])] != dispName {
+                names[String(parts[0])] = dispName
+                UserDefaults.standard.set(names, forKey: "layoutNames")
+            }
+            LayoutStore.noteHello(id: String(parts[0]), prevSeen: prev)
             return
         }
         if kind == "reset" {
@@ -594,6 +616,28 @@ func cursorTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent
 /// 相方がいる方向。レイアウトは「方向 → 相方のマシンID」で持ち、3台以上でも数珠つなぎに渡せる
 enum PartnerDir: String {
     case right, left, up, down
+    var opposite: PartnerDir {
+        switch self {
+        case .right: return .left
+        case .left: return .right
+        case .up: return .down
+        case .down: return .up
+        }
+    }
+}
+
+/// 隣接リンク: 方向 + 相手 + 自分の辺のうち相手と重なる範囲(割合)。
+/// ずらした配置では辺の一部だけが重なるため、範囲を持つ
+struct PeerLink {
+    var dir: PartnerDir
+    var id: String
+    var start: Double
+    var end: Double
+    /// 保存・配信用("相手ID"、範囲が一部のときは "相手ID@開始@終了")
+    var spec: String {
+        if start <= 0.0005 && end >= 0.9995 { return id }
+        return "\(id)@\(String(format: "%.3f", start))@\(String(format: "%.3f", end))"
+    }
 }
 
 /// カーソル共有の試作。
@@ -605,8 +649,8 @@ final class CursorShare {
     var enabled = UserDefaults.standard.bool(forKey: "cursorShare")
     var onStatus: ((String) -> Void)?
 
-    /// 方向 → 相方のマシンID
-    private(set) var neighbors: [PartnerDir: String] = [:]
+    /// 隣接リンクの表(レイアウトから導かれる。手動設定の置き場もここ)
+    private(set) var links: [PeerLink] = []
 
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
@@ -631,25 +675,75 @@ final class CursorShare {
     private var multAccX = 0.0, multAccY = 0.0         // 倍率の端数を持ち越す
 
     private init() {
-        for dir in [PartnerDir.right, .left, .up, .down] {
-            if let id = UserDefaults.standard.string(forKey: "neighbor_" + dir.rawValue) {
-                neighbors[dir] = id
-            }
-        }
-    }
-
-    func setNeighbor(_ dir: PartnerDir, id: String?) {
-        neighbors[dir] = id
-        let key = "neighbor_" + dir.rawValue
-        if let id = id {
-            UserDefaults.standard.set(id, forKey: key)
+        // 新形式(linksV2)を読み、無ければ旧形式(neighbor_*)から移行する
+        if let s = UserDefaults.standard.string(forKey: "linksV2") {
+            links = Self.parseLinks(s)
         } else {
-            UserDefaults.standard.removeObject(forKey: key)
+            var migrated: [PeerLink] = []
+            for dir in [PartnerDir.right, .left, .up, .down] {
+                if let id = UserDefaults.standard.string(forKey: "neighbor_" + dir.rawValue) {
+                    migrated.append(PeerLink(dir: dir, id: id, start: 0, end: 1))
+                }
+            }
+            links = migrated
+            if !migrated.isEmpty { saveLinks() }
         }
     }
 
-    func dir(ofPeer id: String) -> PartnerDir? {
-        neighbors.first { $0.value == id }?.key
+    /// 保存・配信用の文字列からリンク表を復元する("right=id@0.00@0.50;left=id2" 形式)
+    static func parseLinks(_ s: String) -> [PeerLink] {
+        var out: [PeerLink] = []
+        for tok in s.split(separator: ";") {
+            let kv = tok.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2, let d = PartnerDir(rawValue: String(kv[0])),
+                  let lk = parseLink(dir: d, spec: String(kv[1])) else { continue }
+            out.append(lk)
+        }
+        return out
+    }
+
+    static func parseLink(dir: PartnerDir, spec: String) -> PeerLink? {
+        let p = spec.split(separator: "@")
+        guard let first = p.first, !first.isEmpty else { return nil }
+        var s = 0.0, e = 1.0
+        if p.count == 3, let a = Double(p[1]), let b = Double(p[2]) { s = min(a, b); e = max(a, b) }
+        return PeerLink(dir: dir, id: String(first), start: s, end: e)
+    }
+
+    private func saveLinks() {
+        let s = links.map { "\($0.dir.rawValue)=\($0.spec)" }.joined(separator: ";")
+        UserDefaults.standard.set(s, forKey: "linksV2")
+    }
+
+    /// リンク表を丸ごと差し替える(レイアウトの割り当て・エディタから)
+    func setLinks(_ newLinks: [PeerLink]) {
+        links = newLinks
+        saveLinks()
+    }
+
+    /// 合図で入ってきた相手を、その方向の隣として覚える(自動学習)。
+    /// 同じ相手が既にその方向にいる(スパン付きの割り当て含む)なら壊さない
+    func learnLink(dir: PartnerDir, id: String) {
+        if links.contains(where: { $0.dir == dir && $0.id == id }) { return }
+        links.removeAll { $0.id == id }
+        links.removeAll { $0.dir == dir }
+        links.append(PeerLink(dir: dir, id: id, start: 0, end: 1))
+        saveLinks()
+    }
+
+    /// その方向の、辺の位置 ratio に重なっているリンク
+    func link(dir: PartnerDir, at ratio: Double) -> PeerLink? {
+        links.first { $0.dir == dir && ratio >= $0.start - 0.001 && ratio <= $0.end + 0.001 }
+    }
+
+    func link(toPeer id: String) -> PeerLink? { links.first { $0.id == id } }
+
+    func dir(ofPeer id: String) -> PartnerDir? { link(toPeer: id)?.dir }
+
+    /// 相手から届いた「共有辺の中の位置」を、自分の辺の位置に直す
+    func entryRatio(forPeer id: String, seg: Double) -> Double {
+        guard let lk = link(toPeer: id) else { return seg }
+        return lk.start + seg * (lk.end - lk.start)
     }
 
     private func peerName(_ id: String) -> String {
@@ -904,19 +998,21 @@ final class CursorShare {
         ]
         for (dir, hit, ratio, outward) in checks {
             if !hit { edgePush[dir] = 0; continue }
-            guard let next = neighbors[dir] else { continue }
+            guard let lk = link(dir: dir, at: ratio) else { continue }
             if push > 0 {
                 edgePush[dir, default: 0] += max(0, outward)
                 if edgePush[dir, default: 0] < push { continue }
             }
+            // 渡す位置は「共有辺の中の割合」に正規化する(ずらした配置でも位置が合うように)
+            let seg = lk.end > lk.start ? min(1, max(0, (ratio - lk.start) / (lk.end - lk.start))) : 0.5
             sending = true
-            awayTo = next
+            awayTo = lk.id
             edgePush.removeAll()
             multAccX = 0; multAccY = 0
-            for _ in 0..<3 { LinkNet.sendFast("enter \(next) \(ratio) \(dir.rawValue)") }
+            for _ in 0..<3 { LinkNet.sendFast("enter \(lk.id) \(seg) \(dir.rawValue)") }
             hideCursor()
             startPinning(at: loc)
-            status("カーソル共有： \(peerName(next)) に渡しました")
+            status("カーソル共有： \(peerName(lk.id)) に渡しました")
             return true
         }
         return false
@@ -967,33 +1063,73 @@ final class CursorShare {
         let rest = Array(args.dropFirst())
         switch kind {
         case "enter":
+            guard rest.count >= 1 else { return }
+            let seg = Double(rest[0]) ?? 0.5
+            // 送り手の出た方向が付いていれば、その反対側の隣として覚える(割り当てが無い環境向けの自動学習)
+            if rest.count >= 2, let exitDir = PartnerDir(rawValue: rest[1]) {
+                learnLink(dir: exitDir.opposite, id: from)
+            }
+            if sending, awayTo != nil {
+                // 輪を一周して起点(自分)に帰ってきた。セッションを畳み、全体へリセットをかけて
+                // 中継者たちの状態も揃える
+                sending = false
+                awayTo = nil
+                showCursor()
+                stopPinning()
+                if let d = dir(ofPeer: from) {
+                    let r = entryRatio(forPeer: from, seg: seg)
+                    let b = allBounds
+                    let pt: CGPoint
+                    switch d {
+                    case .right: pt = CGPoint(x: Double(b.maxX) - 1, y: Double(b.minY) + r * Double(b.height))
+                    case .left: pt = CGPoint(x: Double(b.minX), y: Double(b.minY) + r * Double(b.height))
+                    case .down: pt = CGPoint(x: Double(b.minX) + r * Double(b.width), y: Double(b.maxY) - 1)
+                    case .up: pt = CGPoint(x: Double(b.minX) + r * Double(b.width), y: Double(b.minY))
+                    }
+                    CGWarpMouseCursorPosition(pt)
+                    CGAssociateMouseAndMouseCursorPosition(1)
+                }
+                LinkNet.sendReset()
+                status("カーソル共有： 一周して戻りました")
+                return
+            }
             // 自分が起点でも、カーソルが手元に戻っている状態なら受け取れる(セッションは相手に譲る)。
             // ここで弾くと「一度送った側には二度と戻せない」非対称な詰まりになる
-            guard awayTo == nil, !holding, forwardTo == nil, rest.count >= 1 else { return }
+            guard awayTo == nil, !holding, forwardTo == nil else { return }
             sending = false
             holding = true
             cameFrom = from
-            let ratio = Double(rest[0]) ?? 0.5
-            if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: ratio) }
+            if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: entryRatio(forPeer: from, seg: seg)) }
             warp()
             status("カーソル共有： \(peerName(from)) から受け取りました")
         case "leave":
             guard rest.count >= 1 else { return }
-            let ratio = Double(rest[0]) ?? 0.5
+            let seg = Double(rest[0]) ?? 0.5
             if awayTo == from {
                 // 起点にカーソルが戻ってきた(セッション自体は継続)
                 awayTo = nil
                 showCursor()
                 stopPinning()
-                if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: ratio); warp() }
+                if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: entryRatio(forPeer: from, seg: seg)); warp() }
                 status("カーソル共有： 手元に戻りました")
             } else if forwardTo == from {
                 // 中継していた先から戻ってきた → 自分が保持者になる(cameFrom は元の相手のまま)
                 forwardTo = nil
                 holding = true
-                if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: ratio); warp() }
+                if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: entryRatio(forPeer: from, seg: seg)); warp() }
                 status("カーソル共有： 戻ってきました")
             }
+        case "assign":
+            // レイアウトの割り当て: リンク表を丸ごと差し替える
+            var newLinks: [PeerLink] = []
+            for tok in rest {
+                let kv = tok.split(separator: "=", maxSplits: 1)
+                guard kv.count == 2, let d = PartnerDir(rawValue: String(kv[0])),
+                      let lk = Self.parseLink(dir: d, spec: String(kv[1])) else { continue }
+                newLinks.append(lk)
+            }
+            setLinks(newLinks)
+            status("レイアウト： 割り当てを受けました")
         case "mv", "dn", "up", "sc", "kd", "ku", "fl":
             if holding {
                 apply(kind, args: rest)
@@ -1019,14 +1155,16 @@ final class CursorShare {
 
     /// 端を越えたときの受け渡し・返却。実行したら true
     private func cross(_ dir: PartnerDir, ratio: Double) -> Bool {
-        guard let next = neighbors[dir] else { return false }
+        guard let lk = link(dir: dir, at: ratio) else { return false }
+        let seg = lk.end > lk.start ? min(1, max(0, (ratio - lk.start) / (lk.end - lk.start))) : 0.5
+        let next = lk.id
         if next == cameFrom {
-            LinkNet.sendFast("leave \(next) \(ratio)")
+            LinkNet.sendFast("leave \(next) \(seg)")
             holding = false
             cameFrom = nil
             status("カーソル共有： 手元に返しました")
         } else {
-            LinkNet.sendFast("enter \(next) \(ratio) \(dir.rawValue)")
+            LinkNet.sendFast("enter \(next) \(seg) \(dir.rawValue)")
             forwardTo = next
             holding = false
             status("カーソル共有： \(peerName(next)) へ渡しました")
@@ -1214,6 +1352,403 @@ final class Multitouch {
     }
 }
 
+
+// MARK: - レイアウト配置
+
+/// 配置(マシンID → 原点)と、そこから導く隣接リンク、割り当ての送信を担当する
+enum LayoutStore {
+    static func loadPos() -> [String: (x: Double, y: Double)] {
+        if let d = UserDefaults.standard.dictionary(forKey: "layoutPos") as? [String: String], !d.isEmpty {
+            var out: [String: (x: Double, y: Double)] = [:]
+            for (k, v) in d {
+                let p = v.split(separator: ",")
+                if p.count == 2, let x = Double(p[0]), let y = Double(p[1]) { out[k] = (x, y) }
+            }
+            if !out.isEmpty { return out }
+        }
+        return synthesizedPos()
+    }
+
+    /// 初回用: 既存のリンク(自分の隣)から配置を組み立てる
+    static func synthesizedPos() -> [String: (x: Double, y: Double)] {
+        let links = CursorShare.shared.links
+        guard !links.isEmpty else { return [:] }
+        var pos: [String: (x: Double, y: Double)] = [LinkNet.machineID: (0, 0)]
+        let my = size(of: LinkNet.machineID)
+        for lk in links where pos[lk.id] == nil {
+            let s = size(of: lk.id)
+            switch lk.dir {
+            case .right: pos[lk.id] = (my.w, 0)
+            case .left: pos[lk.id] = (-s.w, 0)
+            case .down: pos[lk.id] = (0, my.h)
+            case .up: pos[lk.id] = (0, -s.h)
+            }
+        }
+        return pos
+    }
+
+    static func savePos(_ pos: [String: (x: Double, y: Double)]) {
+        var d: [String: String] = [:]
+        for (k, v) in pos { d[k] = "\(Int(v.x.rounded())),\(Int(v.y.rounded()))" }
+        UserDefaults.standard.set(d, forKey: "layoutPos")
+    }
+
+    static func size(of id: String) -> (w: Double, h: Double) {
+        if id == LinkNet.machineID {
+            let union = NSScreen.screens.reduce(NSRect.zero) { $0.union($1.frame) }
+            if union.width > 0 { return (Double(union.width), Double(union.height)) }
+            return (1920, 1080)
+        }
+        if let s = LinkNet.peerSizes[id] { return (Double(s.w), Double(s.h)) }
+        return (1920, 1080)
+    }
+
+    static func rects(pos: [String: (x: Double, y: Double)]) -> [String: CGRect] {
+        var out: [String: CGRect] = [:]
+        for (id, p) in pos {
+            let s = size(of: id)
+            out[id] = CGRect(x: p.x, y: p.y, width: s.w, height: s.h)
+        }
+        return out
+    }
+
+    static func name(of id: String) -> String {
+        if id == LinkNet.machineID { return Host.current().localizedName ?? "Mac" }
+        if let n = LinkNet.peers[id]?.name { return n }
+        let cache = UserDefaults.standard.dictionary(forKey: "layoutNames") as? [String: String] ?? [:]
+        return cache[id] ?? id
+    }
+
+    /// 配置から全マシンのリンク表を導く(辺が接し、30px以上重なる相手が隣)
+    static func derive(rects: [String: CGRect]) -> [String: [PeerLink]] {
+        var result: [String: [PeerLink]] = [:]
+        let tol: CGFloat = 24
+        for (id, r) in rects {
+            var mine: [PeerLink] = []
+            for (oid, o) in rects where oid != id {
+                if abs(o.minX - r.maxX) <= tol {
+                    let lo = max(r.minY, o.minY), hi = min(r.maxY, o.maxY)
+                    if hi - lo >= 30 { mine.append(PeerLink(dir: .right, id: oid, start: (lo - r.minY) / r.height, end: (hi - r.minY) / r.height)) }
+                }
+                if abs(o.maxX - r.minX) <= tol {
+                    let lo = max(r.minY, o.minY), hi = min(r.maxY, o.maxY)
+                    if hi - lo >= 30 { mine.append(PeerLink(dir: .left, id: oid, start: (lo - r.minY) / r.height, end: (hi - r.minY) / r.height)) }
+                }
+                if abs(o.minY - r.maxY) <= tol {
+                    let lo = max(r.minX, o.minX), hi = min(r.maxX, o.maxX)
+                    if hi - lo >= 30 { mine.append(PeerLink(dir: .down, id: oid, start: (lo - r.minX) / r.width, end: (hi - r.minX) / r.width)) }
+                }
+                if abs(o.maxY - r.minY) <= tol {
+                    let lo = max(r.minX, o.minX), hi = min(r.maxX, o.maxX)
+                    if hi - lo >= 30 { mine.append(PeerLink(dir: .up, id: oid, start: (lo - r.minX) / r.width, end: (hi - r.minX) / r.width)) }
+                }
+            }
+            result[id] = mine
+        }
+        return result
+    }
+
+    /// 配置を保存し、自分のリンクへ反映し、他の全マシンへ割り当てを送る
+    static func apply(pos: [String: (x: Double, y: Double)]) {
+        savePos(pos)
+        let all = derive(rects: rects(pos: pos))
+        CursorShare.shared.setLinks(all[LinkNet.machineID] ?? [])
+        for (id, lks) in all where id != LinkNet.machineID { sendAssign(to: id, links: lks) }
+        let members = Set(UserDefaults.standard.stringArray(forKey: "layoutMembers") ?? [])
+        for id in members where pos[id] == nil && id != LinkNet.machineID { sendAssign(to: id, links: []) }
+        UserDefaults.standard.set(Array(pos.keys), forKey: "layoutMembers")
+    }
+
+    static func sendAssign(to id: String, links: [PeerLink]) {
+        if links.isEmpty {
+            LinkNet.sendFast("assign \(id) none")
+        } else {
+            LinkNet.sendFast("assign \(id) " + links.map { "\($0.dir.rawValue)=\($0.spec)" }.joined(separator: " "))
+        }
+        lastAssign[id] = Date()
+    }
+
+    private static var lastAssign: [String: Date] = [:]
+
+    /// hello のたびに呼ばれる。久しぶりに現れた相手には、覚えている割り当てを送り直す
+    static func noteHello(id: String, prevSeen: Date?) {
+        let pos = loadPos()
+        guard pos[id] != nil else { return }
+        let now = Date()
+        if let prev = prevSeen, now.timeIntervalSince(prev) < 25 { return }
+        if let last = lastAssign[id], now.timeIntervalSince(last) < 60 { return }
+        let all = derive(rects: rects(pos: pos))
+        sendAssign(to: id, links: all[id] ?? [])
+    }
+}
+
+/// レイアウト編集のキャンバス。タイルをドラッグして並べ、辺がくっついた相手を隣にする。
+/// スナップ有効時は、他のタイルの辺(隣接)・上辺・下辺・中央に吸着し、ガイド線を出す
+final class LayoutCanvasView: NSView {
+    private var pos: [String: (x: Double, y: Double)] = LayoutStore.loadPos()
+    var snapEnabled = UserDefaults.standard.object(forKey: "layoutSnap") as? Bool ?? true
+
+    private var dragID: String?
+    private var dragFromTray = false
+    private var grabDX = 0.0, grabDY = 0.0
+    private var dragRect = CGRect.zero
+    private var guideX: [Double] = []
+    private var guideY: [Double] = []
+    private var curScene = CGRect.zero
+    private var curK: CGFloat = 0.15
+    private var timer: Timer?
+
+    private var trayHeight: CGFloat { 96 }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        timer?.invalidate()
+        timer = nil
+        if window != nil {
+            timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                self?.needsDisplay = true
+            }
+        }
+    }
+
+    // MARK: 座標変換(配置座標は y 下向き、ビューは y 上向き)
+    private func freezeTransform() {
+        let rs = Array(LayoutStore.rects(pos: pos).values)
+        var scene: CGRect
+        if rs.isEmpty {
+            let s = LayoutStore.size(of: LinkNet.machineID)
+            scene = CGRect(x: 0, y: 0, width: s.w, height: s.h)
+        } else {
+            scene = rs.dropFirst().reduce(rs[0]) { $0.union($1) }
+        }
+        scene = scene.insetBy(dx: -160, dy: -160)
+        curScene = scene
+        let availW = Double(bounds.width) - 24
+        let availH = Double(bounds.height - trayHeight) - 24
+        curK = CGFloat(min(availW / Double(scene.width), availH / Double(scene.height)))
+    }
+
+    private func toView(_ r: CGRect) -> NSRect {
+        let k = Double(curK)
+        let x = 12 + (Double(r.minX) - Double(curScene.minX)) * k
+        let topDist = (Double(r.minY) - Double(curScene.minY)) * k
+        let y = Double(bounds.height) - 12 - topDist - Double(r.height) * k
+        return NSRect(x: x, y: y, width: Double(r.width) * k, height: Double(r.height) * k)
+    }
+
+    private func toArrangement(_ p: NSPoint) -> (x: Double, y: Double) {
+        let k = Double(curK)
+        let x = Double(curScene.minX) + (Double(p.x) - 12) / k
+        let y = Double(curScene.minY) + (Double(bounds.height) - 12 - Double(p.y)) / k
+        return (x, y)
+    }
+
+    private func trayIDs() -> [String] {
+        let now = Date()
+        var ids: [String] = []
+        for (id, info) in LinkNet.peers where now.timeIntervalSince(info.seen) < 120 && pos[id] == nil {
+            ids.append(id)
+        }
+        return ids.sorted { LayoutStore.name(of: $0) < LayoutStore.name(of: $1) }
+    }
+
+    private func trayRect(index: Int, id: String) -> NSRect {
+        let s = LayoutStore.size(of: id)
+        let w = 132.0, h = 60.0
+        let ratio = min(w / s.w, h / s.h)
+        let tw = s.w * ratio, th = s.h * ratio
+        let x = 16 + Double(index) * (w + 12) + (w - tw) / 2
+        let y = 14 + (h - th) / 2
+        return NSRect(x: x, y: y, width: tw, height: th)
+    }
+
+    // MARK: ドラッグ
+    override func mouseDown(with event: NSEvent) {
+        freezeTransform()
+        let p = convert(event.locationInWindow, from: nil)
+        for (id, r) in LayoutStore.rects(pos: pos) {
+            if toView(r).contains(p) {
+                dragID = id
+                dragFromTray = false
+                let ap = toArrangement(p)
+                grabDX = ap.x - Double(r.minX)
+                grabDY = ap.y - Double(r.minY)
+                dragRect = r
+                needsDisplay = true
+                return
+            }
+        }
+        for (i, id) in trayIDs().enumerated() {
+            if trayRect(index: i, id: id).contains(p) {
+                dragID = id
+                dragFromTray = true
+                let s = LayoutStore.size(of: id)
+                let ap = toArrangement(p)
+                grabDX = s.w / 2
+                grabDY = s.h / 2
+                dragRect = CGRect(x: ap.x - grabDX, y: ap.y - grabDY, width: s.w, height: s.h)
+                needsDisplay = true
+                return
+            }
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let id = dragID else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        let ap = toArrangement(p)
+        var nx = ap.x - grabDX
+        var ny = ap.y - grabDY
+        guideX = []
+        guideY = []
+        if snapEnabled {
+            let w = Double(dragRect.width), h = Double(dragRect.height)
+            let others = LayoutStore.rects(pos: pos).filter { $0.key != id }.map { $0.value }
+            let threshold = 14.0 / Double(curK)
+            var bestX: (val: Double, delta: Double, guide: Double)?
+            var bestY: (val: Double, delta: Double, guide: Double)?
+            for o in others {
+                let ox = Double(o.minX), oMaxX = Double(o.maxX), oMidX = Double(o.midX)
+                let oy = Double(o.minY), oMaxY = Double(o.maxY), oMidY = Double(o.midY)
+                for (cand, guide) in [(ox - w, ox), (oMaxX, oMaxX), (ox, ox), (oMaxX - w, oMaxX), (oMidX - w / 2, oMidX)] {
+                    let d = abs(cand - nx)
+                    if d <= threshold && (bestX == nil || d < bestX!.delta) { bestX = (cand, d, guide) }
+                }
+                for (cand, guide) in [(oy - h, oy), (oMaxY, oMaxY), (oy, oy), (oMaxY - h, oMaxY), (oMidY - h / 2, oMidY)] {
+                    let d = abs(cand - ny)
+                    if d <= threshold && (bestY == nil || d < bestY!.delta) { bestY = (cand, d, guide) }
+                }
+            }
+            if let b = bestX { nx = b.val; guideX = [b.guide] }
+            if let b = bestY { ny = b.val; guideY = [b.guide] }
+        }
+        dragRect.origin = CGPoint(x: nx, y: ny)
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let id = dragID else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        if Double(p.y) < Double(trayHeight) {
+            pos[id] = nil
+        } else {
+            pos[id] = (Double(dragRect.minX), Double(dragRect.minY))
+        }
+        dragID = nil
+        dragFromTray = false
+        guideX = []
+        guideY = []
+        LayoutStore.apply(pos: pos)
+        needsDisplay = true
+    }
+
+    // MARK: 描画
+    override func draw(_ dirtyRect: NSRect) {
+        if dragID == nil { freezeTransform() }
+        NSColor.controlBackgroundColor.setFill()
+        bounds.fill()
+        let tray = NSRect(x: 0, y: 0, width: bounds.width, height: trayHeight)
+        NSColor.windowBackgroundColor.setFill()
+        tray.fill()
+        NSColor.separatorColor.setStroke()
+        let sep = NSBezierPath()
+        sep.move(to: NSPoint(x: 0, y: Double(trayHeight) - 0.5))
+        sep.line(to: NSPoint(x: Double(bounds.width), y: Double(trayHeight) - 0.5))
+        sep.lineWidth = 1
+        sep.stroke()
+        let label = "未配置（ここからドラッグで配置、下の帯へ戻すと外れます）"
+        let lattrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]
+        (label as NSString).draw(at: NSPoint(x: 16, y: Double(trayHeight) - 22), withAttributes: lattrs)
+
+        // スナップのガイド線
+        NSColor.controlAccentColor.withAlphaComponent(0.65).setStroke()
+        for gx in guideX {
+            let v = toView(CGRect(x: gx, y: curScene.minY, width: 0, height: curScene.height))
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: v.minX, y: trayHeight))
+            path.line(to: NSPoint(x: v.minX, y: bounds.height))
+            path.lineWidth = 1
+            path.stroke()
+        }
+        for gy in guideY {
+            let v = toView(CGRect(x: curScene.minX, y: gy, width: curScene.width, height: 0))
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: 0, y: v.maxY))
+            path.line(to: NSPoint(x: bounds.width, y: v.maxY))
+            path.lineWidth = 1
+            path.stroke()
+        }
+
+        for (id, r) in LayoutStore.rects(pos: pos) where id != dragID {
+            drawTile(id: id, viewRect: toView(r), dragging: false)
+        }
+        for (i, id) in trayIDs().enumerated() where id != dragID {
+            drawTile(id: id, viewRect: trayRect(index: i, id: id), dragging: false)
+        }
+        if let id = dragID {
+            drawTile(id: id, viewRect: toView(dragRect), dragging: true)
+        }
+    }
+
+    private func drawTile(id: String, viewRect: NSRect, dragging: Bool) {
+        let path = NSBezierPath(roundedRect: viewRect, xRadius: 8, yRadius: 8)
+        let isSelf = id == LinkNet.machineID
+        let online = isSelf || (LinkNet.peers[id].map { Date().timeIntervalSince($0.seen) < 120 } ?? false)
+        (online ? NSColor.textBackgroundColor : NSColor.textBackgroundColor.withAlphaComponent(0.4)).setFill()
+        path.fill()
+        (isSelf ? NSColor.controlAccentColor : NSColor.separatorColor).setStroke()
+        path.lineWidth = (isSelf ? 2.5 : 1.5) + (dragging ? 1.5 : 0)
+        path.stroke()
+        let name = LayoutStore.name(of: id) + (isSelf ? "（自分）" : "")
+        let s = LayoutStore.size(of: id)
+        let sub = "\(Int(s.w))×\(Int(s.h))" + (online ? "" : "・応答なし")
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        let nameAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor, .paragraphStyle: style]
+        let subAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: style]
+        let midY = Double(viewRect.midY)
+        let nameRect = NSRect(x: viewRect.minX + 4, y: CGFloat(midY - 2), width: viewRect.width - 8, height: 16)
+        (name as NSString).draw(in: nameRect, withAttributes: nameAttrs)
+        let subRect = NSRect(x: viewRect.minX + 4, y: CGFloat(midY - 18), width: viewRect.width - 8, height: 13)
+        (sub as NSString).draw(in: subRect, withAttributes: subAttrs)
+    }
+}
+
+/// レイアウト編集ウィンドウ
+final class LayoutWindowController: NSWindowController {
+    private var canvas: LayoutCanvasView!
+
+    convenience init() {
+        self.init(window: nil)
+        canvas = LayoutCanvasView(frame: NSRect(x: 0, y: 0, width: 680, height: 470))
+        canvas.setContentHuggingPriority(.defaultLow, for: .vertical)
+        canvas.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let snapBox = NSButton(checkboxWithTitle: "スナップ（辺・上辺・下辺・中央に吸着）", target: self, action: #selector(toggleSnap(_:)))
+        snapBox.state = canvas.snapEnabled ? .on : .off
+        let hint = NSTextField(labelWithString: "辺がくっついた相手が「隣」になります。配置は全マシンへ自動で配られます")
+        hint.textColor = .secondaryLabelColor
+        hint.font = .systemFont(ofSize: 11)
+        let bar = NSStackView(views: [snapBox, hint])
+        bar.orientation = .horizontal
+        bar.spacing = 16
+        bar.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+        let root = NSStackView(views: [bar, canvas])
+        root.orientation = .vertical
+        root.spacing = 0
+        root.distribution = .fill
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 520), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.title = "レイアウト編集"
+        window.contentView = root
+        window.minSize = NSSize(width: 480, height: 400)
+        self.window = window
+    }
+
+    @objc func toggleSnap(_ b: NSButton) {
+        canvas.snapEnabled = b.state == .on
+        UserDefaults.standard.set(canvas.snapEnabled, forKey: "layoutSnap")
+    }
+}
+
 // MARK: - クリップボード共有
 
 /// テキストだけを全ピアで共有する(上限 64KB、トグル式・既定オフ)。
@@ -1315,7 +1850,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var remoteItem: NSMenuItem!
     var linkItem: NSMenuItem!
     var cursorItem: NSMenuItem!
-    var layoutMenu: NSMenu!
+    var layoutWC: LayoutWindowController?
     var tapItem: NSMenuItem!
     var lastItem: NSMenuItem!
     var mtItem: NSMenuItem!
@@ -1341,10 +1876,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cursorItem.target = self
         clipItem = NSMenuItem(title: "クリップボード共有", action: #selector(toggleClip), keyEquivalent: "")
         clipItem.target = self
-        let layoutParent = NSMenuItem(title: "レイアウト（相方の配置）", action: nil, keyEquivalent: "")
-        layoutMenu = NSMenu()
-        layoutMenu.delegate = self
-        layoutParent.submenu = layoutMenu
+        let layoutItem = NSMenuItem(title: "レイアウトを編集…", action: #selector(openLayoutEditor), keyEquivalent: "")
+        layoutItem.target = self
         tapItem = NSMenuItem(title: "キー送信をセッション方式にする", action: #selector(toggleTap), keyEquivalent: "")
         tapItem.target = self
         let moveParent = NSMenuItem(title: "画面移動の調整", action: nil, keyEquivalent: "")
@@ -1386,7 +1919,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self
-        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(tapItem); menu.addItem(layoutParent); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
         cursorShowItem = NSMenuItem(title: "カーソルを大きく表示", action: #selector(toggleCursorShow), keyEquivalent: "")
         cursorShowItem.target = self
@@ -1537,54 +2070,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshMenu()
     }
 
-    /// レイアウトメニューは開くたびに、発見済みの相方から作り直す
     func menuNeedsUpdate(_ menu: NSMenu) {
-        if menu == item.menu { refreshCursorMenu(); return }
-        guard menu == layoutMenu else { return }
-        menu.removeAllItems()
-        let me = NSMenuItem(title: "この Mac： \(Host.current().localizedName ?? "Mac")（ID: \(LinkNet.machineID)）", action: nil, keyEquivalent: "")
-        me.isEnabled = false
-        menu.addItem(me)
-        menu.addItem(.separator())
-        // 最近(30秒以内)に合図があった相手だけを出す。古い記録が残ると同じ相手が二つに見えるため
-        let peers = LinkNet.peers.filter { Date().timeIntervalSince($0.value.seen) < 30 }.sorted { $0.value.name < $1.value.name }
-        if peers.isEmpty {
-            let none = NSMenuItem(title: "相方が見つかっていません（相手でもアプリを起動してください）", action: nil, keyEquivalent: "")
-            none.isEnabled = false
-            menu.addItem(none)
-            return
-        }
-        for (id, info) in peers {
-            let parent = NSMenuItem(title: "\(info.name)（ID: \(id)）", action: nil, keyEquivalent: "")
-            let sub = NSMenu()
-            for (label, raw) in [("右に置く", "right"), ("左に置く", "left"), ("上に置く", "up"), ("下に置く", "down"), ("外す", "none")] {
-                let it = NSMenuItem(title: label, action: #selector(setNeighborFromMenu(_:)), keyEquivalent: "")
-                it.target = self
-                it.representedObject = "\(raw)|\(id)"
-                if raw == "none" {
-                    it.state = CursorShare.shared.dir(ofPeer: id) == nil ? .on : .off
-                } else if let d = PartnerDir(rawValue: raw) {
-                    it.state = CursorShare.shared.neighbors[d] == id ? .on : .off
-                }
-                sub.addItem(it)
-            }
-            parent.submenu = sub
-            menu.addItem(parent)
-        }
+        if menu == item.menu { refreshCursorMenu() }
     }
 
-    @objc func setNeighborFromMenu(_ sender: NSMenuItem) {
-        guard let s = sender.representedObject as? String else { return }
-        let parts = s.split(separator: "|", maxSplits: 1)
-        guard parts.count == 2 else { return }
-        let raw = String(parts[0]), id = String(parts[1])
-        // 同じ相手が別の方向にいたら先に外す(相手は1方向にだけ置く)
-        if let old = CursorShare.shared.dir(ofPeer: id) {
-            CursorShare.shared.setNeighbor(old, id: nil)
+    @objc func openLayoutEditor() {
+        if layoutWC == nil {
+            layoutWC = LayoutWindowController()
+            layoutWC?.window?.center()
         }
-        if raw != "none", let d = PartnerDir(rawValue: raw) {
-            CursorShare.shared.setNeighbor(d, id: id)
-        }
+        layoutWC?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc func toggleLogin() {

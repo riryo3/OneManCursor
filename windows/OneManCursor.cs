@@ -7,7 +7,7 @@
 //  2) カーソル共有の参加者 → 合図でカーソルを受け取り、自分の画面で再現する。
 //     隣がいる端を越えたら次の相手へ中継し、来た相手の側の端を越えたら返す。
 // 設定は OneManCursor.ini (この exe と同じフォルダ) に書く:
-//   name=表示名 / left=左隣のID / right=右隣のID / up= / down= / id=自分のID(自動生成) / push=端の押し込み量(px、0=即時) / clip=クリップボード共有(1で有効)
+//   name=表示名 / id=自分のID(自動生成) / links=隣の割り当て(自動) / push=端の押し込み量(px、0=即時) / clip=クリップボード共有(1で有効)
 
 using System;
 using System.Collections.Generic;
@@ -29,7 +29,56 @@ internal static class Program
     private static string myId;
     private static string myName;
     private static readonly Dictionary<string, string> configKv = new Dictionary<string, string>();
-    private static readonly Dictionary<string, string> neighbor = new Dictionary<string, string>(); // "left" など → 相手のID
+    // 隣接リンク(dir + spec)。spec は "相手ID" または "相手ID@開始@終了"(辺の重なり)
+    private sealed class PeerLinkC
+    {
+        public string Dir;
+        public string Spec;
+        public string Id { get { return SpecId(Spec); } }
+    }
+    private static readonly List<PeerLinkC> links = new List<PeerLinkC>();
+
+    private static string SpecId(string spec)
+    {
+        int at = spec.IndexOf('@');
+        return at < 0 ? spec : spec.Substring(0, at);
+    }
+
+    private static void SpecSpan(string spec, out double s, out double e)
+    {
+        s = 0; e = 1;
+        string[] p = spec.Split('@');
+        double a, b;
+        if (p.Length == 3
+            && double.TryParse(p[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out a)
+            && double.TryParse(p[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out b))
+        { s = Math.Min(a, b); e = Math.Max(a, b); }
+    }
+
+    private static PeerLinkC FindLink(string dir, double ratio)
+    {
+        foreach (PeerLinkC l in links)
+        {
+            if (l.Dir != dir) continue;
+            double s, e;
+            SpecSpan(l.Spec, out s, out e);
+            if (ratio >= s - 0.001 && ratio <= e + 0.001) return l;
+        }
+        return null;
+    }
+
+    private static PeerLinkC FindLinkTo(string id)
+    {
+        foreach (PeerLinkC l in links) if (l.Id == id) return l;
+        return null;
+    }
+
+    private static void SaveLinks()
+    {
+        List<string> parts = new List<string>();
+        foreach (PeerLinkC l in links) parts.Add(l.Dir + "=" + l.Spec);
+        configKv["links"] = string.Join(";", parts.ToArray());
+    }
     private static readonly Dictionary<long, DateTime> seenActions = new Dictionary<long, DateTime>();
     private static readonly Dictionary<string, DateTime> seenCursor = new Dictionary<string, DateTime>();
     private static readonly Dictionary<string, string> peers = new Dictionary<string, string>();
@@ -164,7 +213,7 @@ internal static class Program
 
     private static void SendHello()
     {
-        byte[] data = Encoding.UTF8.GetBytes(Magic + myId + " 0 hello " + myName);
+        byte[] data = Encoding.UTF8.GetBytes(Magic + myId + " 0 hello " + myName + " " + ScrW + "x" + ScrH);
         try { sender.Send(data, data.Length, new IPEndPoint(IPAddress.Broadcast, Port)); }
         catch (Exception) { }
     }
@@ -207,10 +256,32 @@ internal static class Program
         myId = id;
         string nm;
         myName = kv.TryGetValue("name", out nm) && nm.Length > 0 ? nm : Environment.MachineName;
-        foreach (string d in new string[] { "left", "right", "up", "down" })
+        string lv;
+        if (kv.TryGetValue("links", out lv) && lv.Length > 0)
         {
-            string v;
-            if (kv.TryGetValue(d, out v) && v.Length > 0) neighbor[d] = v;
+            foreach (string tok in lv.Split(';'))
+            {
+                int eq = tok.IndexOf('=');
+                if (eq <= 0) continue;
+                PeerLinkC l = new PeerLinkC();
+                l.Dir = tok.Substring(0, eq);
+                l.Spec = tok.Substring(eq + 1);
+                if (l.Spec.Length > 0) links.Add(l);
+            }
+        }
+        else
+        {
+            foreach (string d in new string[] { "left", "right", "up", "down" })
+            {
+                string v;
+                if (kv.TryGetValue(d, out v) && v.Length > 0)
+                {
+                    PeerLinkC l = new PeerLinkC();
+                    l.Dir = d;
+                    l.Spec = v;
+                    links.Add(l);
+                }
+            }
         }
         string pv;
         if (kv.TryGetValue("push", out pv)) int.TryParse(pv, out pushPx);
@@ -233,13 +304,13 @@ internal static class Program
         try
         {
             string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "OneManCursor.ini");
+            SaveLinks();
             StringBuilder sb = new StringBuilder();
             sb.AppendLine("; ワンマンカーソル Windows 設定 (隣は自動でも覚えます)");
             string v;
             sb.AppendLine("name=" + (configKv.TryGetValue("name", out v) ? v : ""));
             sb.AppendLine("id=" + myId);
-            foreach (string d in new string[] { "left", "right", "up", "down" })
-                sb.AppendLine(d + "=" + (configKv.TryGetValue(d, out v) ? v : ""));
+            sb.AppendLine("links=" + (configKv.TryGetValue("links", out v) ? v : ""));
             sb.AppendLine("push=" + (configKv.TryGetValue("push", out v) ? v : ""));
             sb.AppendLine("clip=" + (configKv.TryGetValue("clip", out v) ? v : ""));
             File.WriteAllText(path, sb.ToString());
@@ -249,18 +320,20 @@ internal static class Program
 
     private static void LearnNeighbor(string dir, string id)
     {
-        string cur;
-        if (neighbor.TryGetValue(dir, out cur) && cur == id) return;
-        neighbor[dir] = id;
-        configKv[dir] = id;
+        foreach (PeerLinkC l in links) if (l.Dir == dir && l.Id == id) return; // 割り当て済み(スパン付き含む)は壊さない
+        links.RemoveAll(l => l.Id == id || l.Dir == dir);
+        PeerLinkC nl = new PeerLinkC();
+        nl.Dir = dir;
+        nl.Spec = id;
+        links.Add(nl);
         SaveConfig();
         Log("カーソル共有: 隣 (" + dir + ") に " + PeerName(id) + " を覚えました");
     }
 
     private static string DirOf(string id)
     {
-        foreach (KeyValuePair<string, string> p in neighbor) if (p.Value == id) return p.Key;
-        return null;
+        PeerLinkC l = FindLinkTo(id);
+        return l != null ? l.Dir : null;
     }
 
     private static string PeerName(string id)
@@ -270,8 +343,16 @@ internal static class Program
     }
 
     // ---- カーソル共有 ----
-    private static void PositionAtEdge(string dir, double ratio)
+    private static void PositionAtEdge(string dir, double ratio, string peerId)
     {
+        // 届いた位置は「共有辺の中の割合」なので、自分の辺の割合に直す
+        PeerLinkC l = FindLinkTo(peerId);
+        if (l != null)
+        {
+            double s, e;
+            SpecSpan(l.Spec, out s, out e);
+            ratio = s + ratio * (e - s);
+        }
         if (dir == "right") { vx = ScrX + ScrW - 1; vy = ScrY + ratio * ScrH; }
         else if (dir == "left") { vx = ScrX; vy = ScrY + ratio * ScrH; }
         else if (dir == "down") { vy = ScrY + ScrH - 1; vx = ScrX + ratio * ScrW; }
@@ -285,18 +366,23 @@ internal static class Program
 
     private static bool Cross(string dir, double ratio)
     {
-        string next;
-        if (!neighbor.TryGetValue(dir, out next)) return false;
+        PeerLinkC l = FindLink(dir, ratio);
+        if (l == null) return false;
+        double s, e;
+        SpecSpan(l.Spec, out s, out e);
+        double seg = e > s ? Math.Min(1, Math.Max(0, (ratio - s) / (e - s))) : 0.5;
+        string next = l.Id;
+        string segText = seg.ToString(System.Globalization.CultureInfo.InvariantCulture);
         if (next == cameFrom)
         {
-            SendFast("leave " + next + " " + ratio.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            SendFast("leave " + next + " " + segText);
             holding = false;
             cameFrom = null;
             Log("カーソル共有: 手元に返しました");
         }
         else
         {
-            SendFast("enter " + next + " " + ratio.ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + dir);
+            SendFast("enter " + next + " " + segText + " " + dir);
             forwardTo = next;
             holding = false;
             Log("カーソル共有: " + PeerName(next) + " へ渡しました");
@@ -373,6 +459,24 @@ internal static class Program
             if (bit != 0 && MacKeyToVK.TryGetValue(code, out vk))
                 SendInputs(MakeKey(vk, (flags & bit) == 0));
         }
+    }
+
+    private static void HandleAssign(string[] args)
+    {
+        links.Clear();
+        foreach (string t in args)
+        {
+            int eq = t.IndexOf('=');
+            if (eq <= 0) continue;
+            string d = t.Substring(0, eq);
+            if (d != "left" && d != "right" && d != "up" && d != "down") continue;
+            PeerLinkC l = new PeerLinkC();
+            l.Dir = d;
+            l.Spec = t.Substring(eq + 1);
+            if (l.Spec.Length > 0) links.Add(l);
+        }
+        SaveConfig();
+        Log("レイアウト: 割り当てを受けました");
     }
 
     // ---- クリップボード共有(テキストのみ・上限64KB) ----
@@ -465,6 +569,7 @@ internal static class Program
         Array.Copy(rest, 1, args, 0, args.Length);
 
         if (kind == "clip") { HandleClipChunk(args, from); return; }
+        if (kind == "assign") { HandleAssign(args); return; }
         if (kind == "enter")
         {
             if (holding || forwardTo != null || args.Length < 1) return;
@@ -480,7 +585,7 @@ internal static class Program
                 if (od != null) { LearnNeighbor(od, from); d = od; }
             }
             if (d == null) d = DirOf(from);
-            if (d != null) PositionAtEdge(d, ratio);
+            if (d != null) PositionAtEdge(d, ratio, from);
             Log("カーソル共有: " + PeerName(from) + " から受け取りました");
         }
         else if (kind == "leave")
@@ -492,7 +597,7 @@ internal static class Program
                 forwardTo = null;
                 holding = true; // cameFrom は元の相手のまま
                 string d = DirOf(from);
-                if (d != null) PositionAtEdge(d, ratio);
+                if (d != null) PositionAtEdge(d, ratio, from);
                 Log("カーソル共有: 戻ってきました");
             }
         }
@@ -683,10 +788,10 @@ internal static class Program
         Log("ワンマンカーソル OneManCursor (Windows)");
         Log("  名前: " + myName + " / 自分のID: " + myId);
         Log("  画面: " + ScrW + "x" + ScrH + " (原点 " + ScrX + "," + ScrY + ")");
-        foreach (KeyValuePair<string, string> p in neighbor)
-            Log("  隣 (" + p.Key + "): " + p.Value);
+        foreach (PeerLinkC l in links)
+            Log("  隣 (" + l.Dir + "): " + l.Spec);
         Log("  UDP " + Port + " で合図を待っています (終了はトレイのアイコンから)");
-        Log("  ※ Mac 側のレイアウト設定で、この ID を相手として置いてください");
+        Log("  ※ レイアウトは Mac 側の「レイアウトを編集」で自動設定されます");
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
@@ -727,6 +832,15 @@ internal static class Program
             if (kind == "hello")
             {
                 string name = string.Join(" ", rest);
+                // 末尾の解像度トークン(例 1920x1080)は名前ではないので落とす
+                if (rest.Length > 0)
+                {
+                    string lastTok = rest[rest.Length - 1];
+                    int xi = lastTok.IndexOf('x');
+                    int hw, hh;
+                    if (xi > 0 && int.TryParse(lastTok.Substring(0, xi), out hw) && int.TryParse(lastTok.Substring(xi + 1), out hh))
+                        name = string.Join(" ", rest, 0, rest.Length - 1);
+                }
                 if (!peers.ContainsKey(from)) Log("相方を発見: " + name + " (ID: " + from + ")");
                 peers[from] = name.Length > 0 ? name : "Mac";
                 continue;

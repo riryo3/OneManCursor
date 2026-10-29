@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-13"
+let buildTag = "Build 20261030-14"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2309,12 +2309,17 @@ final class SwitchSync {
     private(set) var switching = false
     private var timer: Timer?
     private var observer: NSObjectProtocol?
+    private var mcTimer: Timer?
+    private var mcActive = false
 
     func start() {
         guard observer == nil else { return }
         observer = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.noteActivation() }
+        let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.pollMC() }
+        RunLoop.main.add(t, forMode: .common)
+        mcTimer = t
     }
 
     /// 一覧が開いている間にアプリが切り替わった = そこで確定した
@@ -2325,7 +2330,7 @@ final class SwitchSync {
 
     /// 自分が Mission Control を開いた: フラグを立て、他端末へ「開く」合図を送る
     func noteLocalOpen() {
-        guard enabled else { return }
+        guard enabled, !switching else { return }
         setFlag(true)
         broadcast("open")
     }
@@ -2351,8 +2356,36 @@ final class SwitchSync {
     }
 
     private func decide() {
+        guard switching else { return }
         setFlag(false)
         broadcast("done")
+    }
+
+    /// Mission Control / Exposé の開閉を検知する(ジェスチャやホットコーナーでも開くので、キーではなく画面を見る)
+    private func pollMC() {
+        guard enabled else { mcActive = false; return }
+        let active = missionControlActive()
+        guard active != mcActive else { return }
+        mcActive = active
+        if active {
+            noteLocalOpen()
+        } else if switching {
+            decide()
+        }
+    }
+
+    /// Mission Control / Exposé が表示中かどうか。公式の判定方法は無いので、
+    /// Dock が画面全体サイズのウィンドウを出しているかで推定する
+    private func missionControlActive() -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
+        for w in list {
+            guard (w[kCGWindowOwnerName as String] as? String) == "Dock",
+                  let b = w[kCGWindowBounds as String] as? [String: Any],
+                  let sw = (b["Width"] as? NSNumber)?.doubleValue,
+                  let sh = (b["Height"] as? NSNumber)?.doubleValue else { continue }
+            for s in NSScreen.screens where sw >= Double(s.frame.width) * 0.9 && sh >= Double(s.frame.height) * 0.9 { return true }
+        }
+        return false
     }
 
     private func broadcast(_ kind: String) {

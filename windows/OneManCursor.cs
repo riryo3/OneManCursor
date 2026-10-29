@@ -40,7 +40,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-23";
+    private const string BuildTag = "Build 20261030-24";
 
     private static string SpecId(string spec)
     {
@@ -690,6 +690,7 @@ internal static class Program
 
     private static void SendSwitchAll(string kind)
     {
+        Log("送信 " + kind);
         List<string> ids = new List<string>(peers.Keys);
         foreach (string pid in ids)
         {
@@ -721,7 +722,7 @@ internal static class Program
         if (!SwitchAlive()) return;
         Log("切り替え連動: 確定を送信");
         switching = false;
-        SendSwitchAll("done");
+        SendSwitchAll("swdone");
     }
 
     private static void InstallSwitchHooks()
@@ -750,7 +751,7 @@ internal static class Program
                     if ((GetAsyncKeyState(0x5B) & 0x8000) != 0 || (GetAsyncKeyState(0x5C) & 0x8000) != 0)
                     {
                         // Win+Tab(タスクビュー)開始: 他端末へ「開く」合図(Win を離すまで再送しない)
-                        if (!winTabArmed) { winTabArmed = true; Log("切り替え連動: Win+Tab 開始"); SetSwitching(true); SendSwitchAll("open"); }
+                        if (!winTabArmed) { winTabArmed = true; Log("切り替え連動: Win+Tab 開始"); SetSwitching(true); SendSwitchAll("swopen"); }
                     }
                 }
                 else if (up && (vk == 0x5B || vk == 0x5C))
@@ -831,8 +832,8 @@ internal static class Program
         if (kind == "clip") { HandleClipChunk(args, from); return; }
         if (kind == "assign") { HandleAssign(args); return; }
         if (kind == "at") { if (args.Length >= 1) cursorAt = args[0]; return; }
-        if (kind == "open") { OpenSwitchLocal(); return; }
-        if (kind == "done") { ReceiveDoneSwitch(); return; }
+        if (kind == "swopen") { OpenSwitchLocal(); return; }
+        if (kind == "swdone") { ReceiveDoneSwitch(); return; }
         if (kind == "srch")
         {
             if (!searching)
@@ -1173,6 +1174,7 @@ internal static class Program
             }
             if (kind == "back" || kind == "forward" || kind == "parent" || kind == "open")
             {
+                Log("受信 " + kind + " → スワイプ振り分け (要素数 " + parts.Length + ")");
                 long seq;
                 if (parts.Length == 3 && long.TryParse(parts[1], out seq)) ReceiveSwipe(kind, seq);
                 continue;
@@ -1194,6 +1196,7 @@ internal static class Program
                     foreach (string k in old) seenCursor.Remove(k);
                 }
             }
+            if (kind != "mv" && kind != "dn" && kind != "up" && kind != "sc" && kind != "kd" && kind != "ku" && kind != "fl") Log("受信 " + kind + " from=" + from + " → 共有処理");
             ReceiveCursor(kind, rest, from);
         }
     }

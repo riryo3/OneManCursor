@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-23"
+let buildTag = "Build 20261030-24"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -174,6 +174,7 @@ final class Engine {
         guard enabled, linkMode else { return }
         guard let action = SwipeAction.fromWire(wire) else { return }
         let front = NSWorkspace.shared.frontmostApplication
+        NetLog.shared.log("スワイプ受信 \(wire): Finder最前面=\(front?.bundleIdentifier == "com.apple.finder")")
         guard front?.bundleIdentifier == "com.apple.finder" else { return }
         postKey(for: action)
         let label = "合図を受信： \(action.rawValue)"
@@ -335,6 +336,7 @@ enum LinkNet {
     /// カーソル共有の細かい合図。送信は専用キューに逃がし、動き(mv)は約6ms分をまとめて送る
     /// (タップの中で同期送信したり、1イベントごとに送ったりすると全体が重くなるため)
     static func sendFast(_ body: String) {
+        if !body.hasPrefix("mv ") { NetLog.shared.log("送信 " + body) }
         sendQueue.async {
             if body.hasPrefix("mv ") {
                 let p = body.split(separator: " ")
@@ -484,6 +486,7 @@ enum LinkNet {
             if let seen = seenSeqs[seq], now - seen < 2 { return }
             seenSeqs[seq] = now
             seenSeqs = seenSeqs.filter { now - $0.value < 10 }
+            NetLog.shared.log("受信 \(kind) from=\(parts[0]) → スワイプ処理")
             Engine.shared.receiveLink(kind)
         } else {
             // カーソル共有の合図: UDP では3回送られてくるので、同じ連番は1回だけ処理する
@@ -492,6 +495,7 @@ enum LinkNet {
             if let seen = seenFast[dupKey], nowFast - seen < 2 { return }
             seenFast[dupKey] = nowFast
             seenFast = seenFast.filter { nowFast - $0.value < 10 }
+            if kind != "mv" && kind != "dn" && kind != "up" && kind != "sc" && kind != "kd" && kind != "ku" && kind != "fl" { NetLog.shared.log("受信 \(kind) from=\(parts[0]) → 共有処理") }
             CursorShare.shared.receive(kind, args: parts.dropFirst(3).map { String($0) }, from: String(parts[0]))
         }
     }
@@ -1219,9 +1223,9 @@ final class CursorShare {
             status("レイアウト： 割り当てを受けました")
         case "at":
             if let holder = rest.first { cursorAtID = holder }
-        case "open":
+        case "swopen":
             SwitchSync.shared.openLocal()
-        case "done":
+        case "swdone":
             SwitchSync.shared.receiveDone()
         case "srch":
             SearchSync.shared.receiveOpen()
@@ -2334,6 +2338,7 @@ final class DialogSnap {
         }
         seenWindows.insert(key)
         if seenWindows.count > 200 { seenWindows.removeAll() }
+        NetLog.shared.log("ダイアログ: 既定ボタンへ移動")
         onNote?("ダイアログの既定ボタンへ移動しました")
     }
 
@@ -2390,7 +2395,7 @@ final class SwitchSync {
     func noteLocalOpen() {
         guard enabled, !switching else { return }
         setFlag(true)
-        broadcast("open")
+        broadcast("swopen")
         onNote?("Mission Control を検知: 合図を送りました")
     }
 
@@ -2412,6 +2417,7 @@ final class SwitchSync {
     /// 他端末から「確定」を受けた: 一覧を開いているときだけ Esc で閉じる
     func receiveDone() {
         guard enabled, switching else { return }
+        NetLog.shared.log("swdone受信: Escで閉じる")
         setFlag(false)
         postKey(53, flags: [])
     }
@@ -2419,7 +2425,7 @@ final class SwitchSync {
     private func decide() {
         guard switching else { return }
         setFlag(false)
-        broadcast("done")
+        broadcast("swdone")
         onNote?("確定を送りました")
     }
 
@@ -2451,6 +2457,7 @@ final class SwitchSync {
     }
 
     private func broadcast(_ kind: String) {
+        NetLog.shared.log("送信 \(kind)")
         for pid in LinkNet.peers.keys where pid != LinkNet.machineID {
             LinkNet.sendFast("\(kind) \(pid)")
         }
@@ -2701,6 +2708,62 @@ final class SearchSync {
     }
 }
 
+// MARK: - ログ (全端末で足跡を残す)
+/// 送受信と主要な動作を、メモリと Documents/cursor-log.txt の両方に残す
+final class NetLog {
+    static let shared = NetLog()
+    private var lines: [String] = []
+    private let lock = NSLock()
+    private var fh: FileHandle?
+    private let fmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
+
+    func start() {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/cursor-log.txt")
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path), let sz = attrs[.size] as? Int, sz > 1_000_000 {
+            try? FileManager.default.removeItem(at: url)
+        }
+        if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
+        fh = try? FileHandle(forWritingTo: url)
+        _ = fh?.seekToEndOfFile()
+        log("=== 起動 \(buildTag) ID=\(LinkNet.machineID) ===")
+    }
+
+    func log(_ s: String) {
+        let line = "\(fmt.string(from: Date())) \(s)"
+        lock.lock()
+        lines.append(line)
+        if lines.count > 400 { lines.removeFirst(lines.count - 400) }
+        if let d = (line + "\n").data(using: .utf8) { fh?.write(d) }
+        lock.unlock()
+    }
+
+    func text() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return lines.joined(separator: "\n")
+    }
+}
+
+final class LogWindowController: NSWindowController {
+    private let tv = NSTextView()
+    init() {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 440), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        w.title = "ログ"
+        let sv = NSScrollView(frame: NSRect(x: 0, y: 0, width: 680, height: 440))
+        sv.autoresizingMask = [.width, .height]
+        sv.hasVerticalScroller = true
+        tv.isEditable = false
+        tv.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        sv.documentView = tv
+        w.contentView?.addSubview(sv)
+        super.init(window: w)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    func refresh() {
+        tv.string = NetLog.shared.text()
+        tv.scrollToEndOfDocument(nil)
+    }
+}
+
 // MARK: - アプリ本体
 
 /// メニューバー用の「指3本」アイコン(テンプレート画像)
@@ -2741,6 +2804,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var snapItem: NSMenuItem!
     var switchItem: NSMenuItem!
     var searchItem: NSMenuItem!
+    var logItem: NSMenuItem!
+    private var logWC: LogWindowController?
     var loginItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -2767,6 +2832,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switchItem.target = self
         searchItem = NSMenuItem(title: "検索の連動", action: #selector(toggleSearch), keyEquivalent: "")
         searchItem.target = self
+        logItem = NSMenuItem(title: "ログを表示", action: #selector(showLog), keyEquivalent: "")
+        logItem.target = self
         snapItem.target = self
         let layoutItem = NSMenuItem(title: "レイアウトを編集…", action: #selector(openLayoutEditor), keyEquivalent: "")
         layoutItem.target = self
@@ -2811,7 +2878,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self
-        menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(snapItem); menu.addItem(switchItem); menu.addItem(searchItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
+        menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(snapItem); menu.addItem(switchItem); menu.addItem(searchItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(logItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
         cursorShowItem = NSMenuItem(title: "カーソルを大きく表示", action: #selector(toggleCursorShow), keyEquivalent: "")
         cursorShowItem.target = self
@@ -2861,6 +2928,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   "スワイプで Finder にキーを送るため、システム設定 → プライバシーとセキュリティ → アクセシビリティ で OneManCursor を許可してください。許可したら OneManCursor を再起動してください。")
         }
 
+        NetLog.shared.start()
         LinkNet.startReceiver()
         LinkNet.startHello()
         LinkNet.startTCP()
@@ -3028,6 +3096,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleSearch() {
         SearchSync.shared.enabled.toggle()
         refreshMenu()
+    }
+
+    @objc func showLog() {
+        if logWC == nil { logWC = LogWindowController() }
+        logWC?.refresh()
+        logWC?.showWindow(nil)
+        logWC?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc func pickPush(_ sender: NSMenuItem) {

@@ -445,7 +445,15 @@ enum LinkNet {
             CursorShare.shared.resetSession()
             return
         }
-        if SwipeAction.fromWire(kind) != nil {
+        if kind == "clip" {
+            // クリップボードの断片: 同じ連番の再送は1回だけ処理する
+            let dupKey = "\(parts[0])-\(seq)"
+            let nowFast = Date().timeIntervalSince1970
+            if let seen = seenFast[dupKey], nowFast - seen < 2 { return }
+            seenFast[dupKey] = nowFast
+            seenFast = seenFast.filter { nowFast - $0.value < 10 }
+            ClipShare.shared.receive(args: parts.dropFirst(3).map { String($0) }, from: String(parts[0]))
+        } else if SwipeAction.fromWire(kind) != nil {
             // スワイプの合図: 複数回・複数経路で届く同じものは1回だけ実行する
             let now = Date().timeIntervalSince1970
             if let seen = seenSeqs[seq], now - seen < 2 { return }
@@ -1206,6 +1214,80 @@ final class Multitouch {
     }
 }
 
+// MARK: - クリップボード共有
+
+/// テキストだけを全ピアで共有する(上限 64KB、トグル式・既定オフ)。
+/// 断片化して送り、経路は sendFast が選ぶ(Mac 同士は TCP、Windows へは UDP)。
+/// 受けたテキストを自分のクリップボードに入れたら、その changeCount を覚えて
+/// 送り返さない(ループ防止)。
+final class ClipShare {
+    static let shared = ClipShare()
+    var enabled = UserDefaults.standard.bool(forKey: "clipShare")
+    var onNote: ((String) -> Void)?
+
+    private var lastChange = NSPasteboard.general.changeCount
+    private var appliedChange = -1
+    private var sendCounter = 0
+    private var assemblies: [String: (total: Int, parts: [Int: String], first: Date)] = [:]
+    private var timer: Timer?
+
+    private init() {}
+
+    func start() {
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.poll() }
+    }
+
+    private func poll() {
+        let pb = NSPasteboard.general
+        let now = Date()
+        assemblies = assemblies.filter { now.timeIntervalSince($0.value.first) < 10 }
+        if !enabled { lastChange = pb.changeCount; return }
+        guard pb.changeCount != lastChange else { return }
+        lastChange = pb.changeCount
+        if pb.changeCount == appliedChange { return }   // 自分が受けて入れたもの
+        guard let s = pb.string(forType: .string), !s.isEmpty, s.utf8.count <= 65536 else { return }
+        send(text: s)
+    }
+
+    private func send(text: String) {
+        let b64 = Data(text.utf8).base64EncodedString()
+        let chunkSize = 800
+        let total = (b64.count + chunkSize - 1) / chunkSize
+        sendCounter += 1
+        let tid = "\(LinkNet.machineID)-\(sendCounter)"
+        for peer in LinkNet.peers.keys {
+            for i in 0..<total {
+                let start = b64.index(b64.startIndex, offsetBy: i * chunkSize)
+                let end = b64.index(start, offsetBy: min(chunkSize, b64.count - i * chunkSize))
+                LinkNet.sendFast("clip \(peer) \(tid) \(i) \(total) \(b64[start..<end])")
+            }
+        }
+        onNote?("クリップボード共有： テキストを送りました")
+    }
+
+    /// LinkNet から呼ばれる。args = [宛先, 転送ID, 番号, 総数, Base64断片]
+    func receive(args: [String], from: String) {
+        guard enabled, args.count == 5, args[0] == LinkNet.machineID,
+              let idx = Int(args[2]), let total = Int(args[3]),
+              total >= 1, total <= 200, idx >= 0, idx < total else { return }
+        let key = "\(from)|\(args[1])"
+        var asm = assemblies[key] ?? (total: total, parts: [:], first: Date())
+        asm.parts[idx] = args[4]
+        assemblies[key] = asm
+        guard asm.parts.count == total else { return }
+        assemblies[key] = nil
+        let b64 = (0..<total).map { asm.parts[$0] ?? "" }.joined()
+        guard let data = Data(base64Encoded: b64), let text = String(data: data, encoding: .utf8),
+              !text.isEmpty, text.utf8.count <= 65536 else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        appliedChange = pb.changeCount
+        lastChange = pb.changeCount
+        onNote?("クリップボード共有： テキストを受け取りました")
+    }
+}
+
 // MARK: - アプリ本体
 
 /// メニューバー用の「指3本」アイコン(テンプレート画像)
@@ -1241,6 +1323,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var diagItem: NSMenuItem!
     var pushItems: [NSMenuItem] = []
     var multItems: [NSMenuItem] = []
+    var clipItem: NSMenuItem!
     var loginItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -1256,6 +1339,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         linkItem.target = self
         cursorItem = NSMenuItem(title: "カーソル共有（端で相手に渡す）", action: #selector(toggleCursor), keyEquivalent: "")
         cursorItem.target = self
+        clipItem = NSMenuItem(title: "クリップボード共有", action: #selector(toggleClip), keyEquivalent: "")
+        clipItem.target = self
         let layoutParent = NSMenuItem(title: "レイアウト（相方の配置）", action: nil, keyEquivalent: "")
         layoutMenu = NSMenu()
         layoutMenu.delegate = self
@@ -1301,7 +1386,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self
-        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(tapItem); menu.addItem(layoutParent); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
+        menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(tapItem); menu.addItem(layoutParent); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
         cursorShowItem = NSMenuItem(title: "カーソルを大きく表示", action: #selector(toggleCursorShow), keyEquivalent: "")
         cursorShowItem.target = self
@@ -1354,6 +1439,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         LinkNet.startReceiver()
         LinkNet.startHello()
         LinkNet.startTCP()
+        ClipShare.shared.onNote = { [weak self] label in
+            self?.flashIcon()
+            self?.lastItem.title = "最後の検出： \(label)"
+        }
+        ClipShare.shared.start()
 
         cursorOverlay.start()
         refreshCursorMenu()
@@ -1404,6 +1494,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         remoteItem.state = Engine.shared.remoteMode ? .on : .off
         linkItem.state = Engine.shared.linkMode ? .on : .off
         cursorItem.state = CursorShare.shared.enabled ? .on : .off
+        clipItem.state = ClipShare.shared.enabled ? .on : .off
         tapItem.state = Engine.shared.keyTapSession ? .on : .off
         diagItem.state = UserDefaults.standard.bool(forKey: "showDiag") ? .on : .off
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -1503,6 +1594,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch {
             alert("ログイン項目を変更できませんでした", error.localizedDescription)
         }
+        refreshMenu()
+    }
+
+    @objc func toggleClip() {
+        ClipShare.shared.enabled.toggle()
+        UserDefaults.standard.set(ClipShare.shared.enabled, forKey: "clipShare")
         refreshMenu()
     }
 

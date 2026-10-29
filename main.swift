@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-19"
+let buildTag = "Build 20261030-20"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2327,7 +2327,14 @@ final class DialogSnap {
         AXValueGetValue(posV as! AXValue, .cgPoint, &pos)
         AXValueGetValue(sizeV as! AXValue, .cgSize, &size)
         guard size.width > 0, size.height > 0 else { return }
-        CGWarpMouseCursorPosition(CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2))
+        let target = CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2)
+        CGWarpMouseCursorPosition(target)
+        // ワープだけだと「見た目の位置」しか変わらず、クリックが前の位置に落ちることがある。
+        // 実イベント(mouseMoved)を1発流して、イベントとしてのマウス位置も一致させる
+        if let mv = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: target, mouseButton: .left) {
+            CursorShare.markSynthetic(mv)
+            mv.post(tap: .cghidEventTap)
+        }
         seenWindows.insert(key)
         if seenWindows.count > 200 { seenWindows.removeAll() }
         onNote?("ダイアログの既定ボタンへ移動しました")

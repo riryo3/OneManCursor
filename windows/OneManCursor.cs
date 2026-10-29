@@ -40,7 +40,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-11";
+    private const string BuildTag = "Build 20261030-12";
 
     private static string SpecId(string spec)
     {
@@ -95,6 +95,22 @@ internal static class Program
     private static string cameFrom = null;
     private static string forwardTo = null;
     private static string cursorAt = null; // カーソルが今いるマシン
+    // 切り替え画面の連動(タスクビュー / Alt+Tab)
+    private static bool switching = false;
+    private static DateTime switchAt = DateTime.MinValue;
+    private static bool altTabArmed = false;
+    private static bool winTabArmed = false;
+    private static IntPtr kbHook = IntPtr.Zero;
+    private static IntPtr fgHook = IntPtr.Zero;
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+    private delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+    private static LowLevelKeyboardProc kbProc;
+    private static WinEventDelegate fgProc;
+    [DllImport("user32.dll")] private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll")] private static extern IntPtr GetModuleHandle(string lpModuleName);
+    [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
     private static double vx = 0, vy = 0;
     private static int pushPx = 0;
     private static double pushAccR = 0, pushAccL = 0, pushAccD = 0, pushAccU = 0;
@@ -620,6 +636,109 @@ internal static class Program
         }
     }
 
+    // ---- 切り替え画面の連動 ----
+    private static bool SwitchAlive()
+    {
+        return switching && (DateTime.Now - switchAt).TotalSeconds < 20;
+    }
+
+    private static void SetSwitching(bool on)
+    {
+        switching = on;
+        if (on) switchAt = DateTime.Now;
+    }
+
+    private static void SendSwitchAll(string kind)
+    {
+        List<string> ids = new List<string>(peers.Keys);
+        foreach (string pid in ids)
+        {
+            if (pid != myId) SendFast(kind + " " + pid);
+        }
+    }
+
+    /// 合図を受けて自分のタスクビューを開く
+    private static void OpenSwitchLocal()
+    {
+        SetSwitching(true);
+        SendInputs(MakeKey(0x5B, false), MakeKey(0x09, false), MakeKey(0x09, true), MakeKey(0x5B, true));
+    }
+
+    /// 他端末から「確定」を受けた: 一覧を開いているときだけ Esc で閉じる
+    private static void ReceiveDoneSwitch()
+    {
+        if (!SwitchAlive()) return;
+        switching = false;
+        SendInputs(MakeKey(0x1B, false), MakeKey(0x1B, true));
+    }
+
+    /// 自分が確定した: 他端末へ知らせる(自分は閉じなくてよい)
+    private static void DecideSwitch()
+    {
+        if (!SwitchAlive()) return;
+        switching = false;
+        SendSwitchAll("done");
+    }
+
+    private static void InstallSwitchHooks()
+    {
+        kbProc = KbHookCallback;
+        fgProc = FgCallback;
+        kbHook = SetWindowsHookEx(13, kbProc, GetModuleHandle(null), 0);
+        fgHook = SetWinEventHook(0x0003, 0x0003, IntPtr.Zero, fgProc, 0, 0, 0);
+    }
+
+    private static IntPtr KbHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            try
+            {
+                int vk = System.Runtime.InteropServices.Marshal.ReadInt32(lParam);
+                int msg = wParam.ToInt32();
+                bool down = msg == 0x0100 || msg == 0x0104;
+                bool up = msg == 0x0101 || msg == 0x0105;
+                if (down && vk == 0x09)
+                {
+                    if ((GetAsyncKeyState(0x12) & 0x8000) != 0)
+                    {
+                        // Alt+Tab 開始: 一覧を開いた扱いにし、他端末へ「開く」合図(Alt を離すまで再送しない)
+                        if (!altTabArmed) { altTabArmed = true; SetSwitching(true); SendSwitchAll("open"); }
+                    }
+                    else if ((GetAsyncKeyState(0x5B) & 0x8000) != 0 || (GetAsyncKeyState(0x5C) & 0x8000) != 0)
+                    {
+                        // Win+Tab(タスクビュー)開始
+                        if (!winTabArmed) { winTabArmed = true; SetSwitching(true); SendSwitchAll("open"); }
+                    }
+                }
+                else if (up && (vk == 0x12 || vk == 0xA4 || vk == 0xA5))
+                {
+                    // Alt を離した = Alt+Tab の確定
+                    if (altTabArmed) { altTabArmed = false; DecideSwitch(); }
+                }
+                else if (up && (vk == 0x5B || vk == 0x5C))
+                {
+                    winTabArmed = false;
+                }
+                else if (down && vk == 0x1B)
+                {
+                    // Esc で一覧を閉じたときも確定と同じ扱い
+                    DecideSwitch();
+                }
+            }
+            catch (Exception) { }
+        }
+        return CallNextHookEx(kbHook, nCode, wParam, lParam);
+    }
+
+    private static void FgCallback(IntPtr h, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+    {
+        // 最前面ウィンドウの変化 = タスクビューでの確定(開いた直後の変化は除く)
+        if (!SwitchAlive()) return;
+        if ((DateTime.Now - switchAt).TotalMilliseconds < 700) return;
+        DecideSwitch();
+    }
+
     private static void ReceiveCursor(string kind, string[] rest, string from)
     {
         // rest[0] は宛先ID
@@ -630,6 +749,8 @@ internal static class Program
         if (kind == "clip") { HandleClipChunk(args, from); return; }
         if (kind == "assign") { HandleAssign(args); return; }
         if (kind == "at") { if (args.Length >= 1) cursorAt = args[0]; return; }
+        if (kind == "open") { OpenSwitchLocal(); return; }
+        if (kind == "done") { ReceiveDoneSwitch(); return; }
         if (kind == "enter")
         {
             if (holding || forwardTo != null || args.Length < 1) return;
@@ -822,6 +943,7 @@ internal static class Program
             menu.Items.Add(clipItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("終了", null, delegate { Exit(); });
+            InstallSwitchHooks();
             icon = new NotifyIcon();
             icon.Text = "ワンマンカーソル " + BuildTag + " (ID: " + myId + ")";
             icon.Icon = MakeWaIcon();

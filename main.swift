@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-11"
+let buildTag = "Build 20261030-12"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -916,6 +916,11 @@ final class CursorShare {
     /// 自分が合成したイベントにつける目印(自分のタップで飲まないため)
     private static let syntheticMarker: Int64 = 0x4653_5750
 
+    /// 合成イベントに目印を付ける(自分のタップで飲まないため)
+    static func markSynthetic(_ e: CGEvent) {
+        e.setIntegerValueField(.eventSourceUserData, value: syntheticMarker)
+    }
+
     func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap = tap { CGEvent.tapEnable(tap: tap, enable: true) }
@@ -934,6 +939,15 @@ final class CursorShare {
         }
         // 非常口は ⌘Esc。Esc 単体はよく使うキーなので、普通のキーとして相手へ送る
         let isEsc = type == .keyDown && event.getIntegerValueField(.keyboardEventKeycode) == 53 && event.flags.contains(.maskCommand)
+        // 切り替え画面の連動: 手元で Ctrl+↑ を押したら「一覧を開いた」、切り替え中の Esc は「確定」
+        if type == .keyDown, awayTo == nil, !holding, forwardTo == nil {
+            let kc = event.getIntegerValueField(.keyboardEventKeycode)
+            if kc == 126, event.flags.contains(.maskControl), !event.flags.contains(.maskCommand) {
+                SwitchSync.shared.noteLocalOpen()
+            } else if kc == 53, !event.flags.contains(.maskCommand) {
+                SwitchSync.shared.noteLocalEsc()
+            }
+        }
 
         // 他機起点のセッションに参加中(保持者・中継者): 物理マウスは位置がずれるので飲む。⌘Esc で全体リセット
         if holding || forwardTo != nil {
@@ -1191,6 +1205,10 @@ final class CursorShare {
             status("レイアウト： 割り当てを受けました")
         case "at":
             if let holder = rest.first { cursorAtID = holder }
+        case "open":
+            SwitchSync.shared.openLocal()
+        case "done":
+            SwitchSync.shared.receiveDone()
         case "mv", "dn", "up", "sc", "kd", "ku", "fl":
             if holding {
                 apply(kind, args: rest)
@@ -2207,6 +2225,94 @@ final class DialogSnap {
     }
 }
 
+/// 切り替え画面の連動: どこかの端末でウィンドウ選択を確定したら、他の端末で
+/// 開いている Mission Control / タスクビューを Esc で閉じる
+final class SwitchSync {
+    static let shared = SwitchSync()
+    var enabled: Bool {
+        get { UserDefaults.standard.object(forKey: "switchSync") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "switchSync") }
+    }
+    private(set) var switching = false
+    private var timer: Timer?
+    private var observer: NSObjectProtocol?
+
+    func start() {
+        guard observer == nil else { return }
+        observer = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.noteActivation() }
+    }
+
+    /// 一覧が開いている間にアプリが切り替わった = そこで確定した
+    private func noteActivation() {
+        guard enabled, switching else { return }
+        decide()
+    }
+
+    /// 自分が Mission Control を開いた: フラグを立て、他端末へ「開く」合図を送る
+    func noteLocalOpen() {
+        guard enabled else { return }
+        setFlag(true)
+        broadcast("open")
+    }
+
+    /// 自分が Esc で一覧を閉じた: 確定と同じ扱いで、他端末の一覧も閉じさせる
+    func noteLocalEsc() {
+        guard enabled, switching else { return }
+        decide()
+    }
+
+    /// 合図を受けて自分の Mission Control を開く
+    func openLocal() {
+        guard enabled else { return }
+        setFlag(true)
+        postKey(126, flags: .maskControl)
+    }
+
+    /// 他端末から「確定」を受けた: 一覧を開いているときだけ Esc で閉じる
+    func receiveDone() {
+        guard enabled, switching else { return }
+        setFlag(false)
+        postKey(53, flags: [])
+    }
+
+    private func decide() {
+        setFlag(false)
+        broadcast("done")
+    }
+
+    private func broadcast(_ kind: String) {
+        for pid in LinkNet.peers.keys where pid != LinkNet.machineID {
+            LinkNet.sendFast("\(kind) \(pid)")
+        }
+    }
+
+    private func setFlag(_ on: Bool) {
+        switching = on
+        timer?.invalidate()
+        timer = nil
+        if on {
+            let t = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
+                self?.switching = false
+            }
+            RunLoop.main.add(t, forMode: .common)
+            timer = t
+        }
+    }
+
+    private func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        for down in [true, false] {
+            if let e = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: down) {
+                e.flags = flags
+                CursorShare.markSynthetic(e)
+                e.post(tap: .cghidEventTap)
+            }
+        }
+    }
+}
+
 // MARK: - アプリ本体
 
 /// メニューバー用の「指3本」アイコン(テンプレート画像)
@@ -2245,6 +2351,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var clipItem: NSMenuItem!
     var cursorAtItem: NSMenuItem!
     var snapItem: NSMenuItem!
+    var switchItem: NSMenuItem!
     var loginItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -2267,6 +2374,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         clipItem = NSMenuItem(title: "クリップボード共有", action: #selector(toggleClip), keyEquivalent: "")
         clipItem.target = self
         snapItem = NSMenuItem(title: "ダイアログの既定ボタンへカーソルを移動", action: #selector(toggleSnap), keyEquivalent: "")
+        switchItem = NSMenuItem(title: "切り替え画面の連動", action: #selector(toggleSwitch), keyEquivalent: "")
+        switchItem.target = self
         snapItem.target = self
         let layoutItem = NSMenuItem(title: "レイアウトを編集…", action: #selector(openLayoutEditor), keyEquivalent: "")
         layoutItem.target = self
@@ -2311,7 +2420,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self
-        menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(snapItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
+        menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(clipItem); menu.addItem(snapItem); menu.addItem(switchItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
         cursorShowItem = NSMenuItem(title: "カーソルを大きく表示", action: #selector(toggleCursorShow), keyEquivalent: "")
         cursorShowItem.target = self
@@ -2370,6 +2479,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         ClipShare.shared.start()
         DialogSnap.shared.start()
+        SwitchSync.shared.start()
 
         cursorOverlay.start()
         refreshCursorMenu()
@@ -2422,6 +2532,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cursorItem.state = CursorShare.shared.enabled ? .on : .off
         clipItem.state = ClipShare.shared.enabled ? .on : .off
         snapItem.state = DialogSnap.shared.enabled ? .on : .off
+        switchItem.state = SwitchSync.shared.enabled ? .on : .off
         tapItem.state = Engine.shared.keyTapSession ? .on : .off
         diagItem.state = UserDefaults.standard.bool(forKey: "showDiag") ? .on : .off
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -2501,6 +2612,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleSnap() {
         DialogSnap.shared.enabled.toggle()
         UserDefaults.standard.set(DialogSnap.shared.enabled, forKey: "snapToDialog")
+        refreshMenu()
+    }
+
+    @objc func toggleSwitch() {
+        SwitchSync.shared.enabled.toggle()
         refreshMenu()
     }
 

@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-24"
+let buildTag = "Build 20261030-25"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2373,6 +2373,8 @@ final class SwitchSync {
     private var observer: NSObjectProtocol?
     private var mcTimer: Timer?
     private var mcActive = false
+    private var mcOn = 0
+    private var mcOff = 0
     var onNote: ((String) -> Void)?
 
     func start() {
@@ -2431,8 +2433,16 @@ final class SwitchSync {
 
     /// Mission Control / Exposé の開閉を検知する(ジェスチャやホットコーナーでも開くので、キーではなく画面を見る)
     private func pollMC() {
-        guard enabled else { mcActive = false; return }
-        let active = missionControlActive()
+        guard enabled else { mcActive = false; mcOn = 0; mcOff = 0; return }
+        // 一瞬だけ出る Dock の窓を Mission Control と誤検知しないよう、
+        // 2回連続(約0.5秒)残った変化だけを本物とみなす(開くのも閉じるのも)
+        if missionControlActive() {
+            mcOn += 1; mcOff = 0
+        } else {
+            if mcOn == 1 { NetLog.shared.log("MC検知: 一瞬のドック窓を無視しました") }
+            mcOff += 1; mcOn = 0
+        }
+        let active = mcActive ? mcOff < 2 : mcOn >= 2
         guard active != mcActive else { return }
         mcActive = active
         if active {

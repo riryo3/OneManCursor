@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-50"
+let buildTag = "Build 20261030-51"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2661,7 +2661,7 @@ final class SwitchSync {
         return f
     }
 
-    private func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags) {
+    func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags) {
         // 修飾キーは flagsChanged として独立に送り、さらに本体キーとは間隔を空けて送る。
         // 一息に全部送ると Dock のショートカット判定が修飾キーの変化を取りこぼす疑いがあるため、
         // 人間の押下(修飾キーを押してから本体キー)に近づける。
@@ -2755,7 +2755,7 @@ final class SearchSync {
     }
     private func timeout() {
         if origin { origin = false; sendAll("sdone") }
-        if receiving { receiving = false; postEsc() }
+        if receiving { receiving = false; closeLocal() }
         disarm()
     }
 
@@ -2854,7 +2854,7 @@ final class SearchSync {
         guard receiving else { return }
         receiving = false
         disarm()
-        postEsc()
+        closeLocal()
     }
 
     /// 受け側: 起点から届いた打鍵(kd/ku/fl)をそのまま再現する。
@@ -2889,20 +2889,18 @@ final class SearchSync {
         }
     }
 
-    /// Esc を本物らしく送る(実flags + 押下と解放の間隔)。
-    /// 薄い合成 Esc(間隔なし・素の flags)は Spotlight に無視されることがある
-    private func postEsc() {
-        let f = CGEventFlags.maskNonCoalesced
-        if let d = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true) {
-            d.flags = f
-            CursorShare.markSynthetic(d)
-            d.post(tap: .cghidEventTap)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
-            if let u = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: false) {
-                u.flags = f
-                CursorShare.markSynthetic(u)
-                u.post(tap: .cghidEventTap)
+    /// 自分の Spotlight を閉じる。Spotlight の Esc は「1回目=検索文字の消去、2回目=閉じる」
+    /// という仕様なので、フォーカスが Spotlight に残っている間は Esc を段階的に送り、
+    /// 最後の手段として、開くときに効いた ⌘+Space(トグル)で閉じる
+    private func closeLocal() {
+        SwitchSync.shared.postKey(53, flags: [])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self = self, self.spotlightFocused() else { return }
+            SwitchSync.shared.postKey(53, flags: [])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                guard let self = self, self.spotlightFocused() else { return }
+                NetLog.shared.log("検索連動: Esc で閉じなかったため ⌘+Space で閉じます")
+                self.postKeyCode(49, flags: .maskCommand)
             }
         }
     }

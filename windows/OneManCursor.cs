@@ -749,7 +749,7 @@ internal static class Program
                     foreach (ImageCodecInfo c in ImageCodecInfo.GetImageEncoders())
                         if (c.MimeType == "image/jpeg") { codec = c; break; }
                     EncoderParameters eps = new EncoderParameters(1);
-                    eps.Param[0] = new EncoderParameter(Encoder.Quality, 55L);
+                    eps.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 55L);
                     if (codec != null) small.Save(ms, codec, eps); else small.Save(ms, ImageFormat.Jpeg);
                     string b64 = Convert.ToBase64String(ms.ToArray());
                     string tid = Guid.NewGuid().ToString("N").Substring(0, 8);

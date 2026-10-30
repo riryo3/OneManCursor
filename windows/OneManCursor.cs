@@ -41,7 +41,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-43";
+    private const string BuildTag = "Build 20261030-44";
 
     private static string SpecId(string spec)
     {
@@ -728,6 +728,7 @@ internal static class Program
 
     private static DateTime lastThumbAt = DateTime.MinValue;
     // レイアウト編集を開いている Mac から threq が来たら、自分の画面の縮小 JPEG を断片で返す
+    // 幅を小さく撮ってあり、タイルで引き伸ばされることで文字は読めない程度にぼける
     private static void SendThumb(string to)
     {
         DateTime now = DateTime.Now;
@@ -740,8 +741,8 @@ internal static class Program
             using (Graphics g = Graphics.FromImage(bmp))
             {
                 g.CopyFromScreen(b.Location, Point.Empty, b.Size);
-                int tw = 320;
-                int th = Math.Max(1, (int)(320.0 * b.Height / Math.Max(1, b.Width)));
+                int tw = 160;
+                int th = Math.Max(1, (int)(160.0 * b.Height / Math.Max(1, b.Width)));
                 using (Bitmap small = new Bitmap(bmp, new Size(tw, th)))
                 using (MemoryStream ms = new MemoryStream())
                 {

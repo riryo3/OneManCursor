@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-52"
+let buildTag = "Build 20261030-53"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2725,6 +2725,7 @@ final class SearchSync {
     private var timer: Timer?
     private var loggedApply = false
     private var openedAt = Date.distantPast
+    private var originTextLen = 0
     var onNote: ((String) -> Void)?
 
     func start() {
@@ -2755,7 +2756,9 @@ final class SearchSync {
     }
     private func timeout() {
         if origin { origin = false; sendAll("sdone") }
-        if receiving { receiving = false; closeLocal() }
+        // 受け側はキー合成で閉じない。終了合図が来なかった場合に遅れて Esc を送ると
+        // 関係ない操作に割り込んでしまうため、状態だけ静かに畳む
+        receiving = false
         disarm()
     }
 
@@ -2765,19 +2768,21 @@ final class SearchSync {
     func noteLocalOpen() {
         guard enabled, !receiving, !origin else { return }
         origin = true
+        originTextLen = 0
         armTimer()
         sendAll("srch")
     }
 
-    /// 起点の Esc: IME の取消かもしれないので、少し待って Spotlight が閉じたかどうかで判断する
-    /// (本当に閉じたときだけ、全端末へ閉じる合図を送る)
+    /// 起点の Esc: 検索文字列が残っているときの Esc は「消去」であって終了ではない。
+    /// Spotlight が開いているかは外部から判定できないため、フォーカス先などは見ず、
+    /// 自分が転送した打鍵の数で判断する(文字があるうちは連動を続け、空のときだけ全台を閉じる)
     func forwardKey(keycode: Int64) {
         guard origin else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            guard let self = self, self.origin else { return }
-            if self.spotlightFocused() { return }  // 変換の取消だった: 何もしない
-            self.noteLocalEnd()
+        if originTextLen > 0 {
+            originTextLen = 0
+            return
         }
+        noteLocalEnd()
     }
 
     /// 起点の打鍵を、カーソル共有と同じ kd/ku/fl の形で全端末へ送る
@@ -2791,20 +2796,12 @@ final class SearchSync {
         default: return
         }
         let kc = event.getIntegerValueField(.keyboardEventKeycode)
+        if type == .keyDown {
+            // Esc の意味(消去か終了か)を判断するため、検索文字列の長さを数えておく
+            if kc == 51 { originTextLen = max(0, originTextLen - 1) }
+            else if kc != 36 && kc != 76 && kc != 48 && !(123...126).contains(kc) { originTextLen += 1 }
+        }
         sendAll(kind, "\(kc) \(event.flags.rawValue)")
-    }
-
-    /// Spotlight がまだ開いているか(フォーカスのある要素の持ち主で見る)。
-    /// Spotlight のウィンドウは CGWindowList から見えないため、ウィンドウ一覧では判定できない
-    private func spotlightFocused() -> Bool {
-        guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.Spotlight" }) else { return false }
-        let sys = AXUIElementCreateSystemWide()
-        var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &ref) == .success,
-              let el = ref else { return false }
-        var pid: pid_t = 0
-        AXUIElementGetPid(el as! AXUIElement, &pid)
-        return pid == app.processIdentifier
     }
 
     /// 起点の検索終了: 他端末の検索も閉じる

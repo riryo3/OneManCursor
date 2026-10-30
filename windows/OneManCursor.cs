@@ -7,7 +7,7 @@
 //  2) カーソル共有の参加者 → 合図でカーソルを受け取り、自分の画面で再現する。
 //     隣がいる端を越えたら次の相手へ中継し、来た相手の側の端を越えたら返す。
 // 設定は OneManCursor.ini (この exe と同じフォルダ) に書く:
-//   name=表示名 / id=自分のID(自動生成) / links=隣の割り当て(自動) / push=端の押し込み量(px、0=即時) / clip=クリップボード共有(1で有効)
+//   name=表示名 / id=自分のID(自動生成) / links=隣の割り当て(自動) / push=端の押し込み量(px、0=即時)
 
 using System;
 using System.Collections.Generic;
@@ -40,7 +40,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-27";
+    private const string BuildTag = "Build 20261030-28";
 
     private static string SpecId(string spec)
     {
@@ -118,16 +118,6 @@ internal static class Program
     private static double pushAccR = 0, pushAccL = 0, pushAccD = 0, pushAccU = 0;
 
     // ---- クリップボード共有 ----
-    private static bool clipEnabled = false;
-    private static uint lastClipSeq = 0;
-    private static bool clipSeqReady = false;
-    private static uint clipAppliedSeq = 0;
-    private static bool clipAppliedValid = false;
-    private static int clipSendCounter = 0;
-    private static string pendingClip = null;
-    private static readonly object clipLock = new object();
-    private sealed class ClipAsm { public int Total; public Dictionary<int, string> Parts = new Dictionary<int, string>(); public DateTime First = DateTime.UtcNow; }
-    private static readonly Dictionary<string, ClipAsm> clipAsm = new Dictionary<string, ClipAsm>();
 
     // ---- user32 ----
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
@@ -161,7 +151,6 @@ internal static class Program
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
     [DllImport("user32.dll")] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -354,8 +343,6 @@ internal static class Program
             }
         }
         if (kv.TryGetValue("push", out pv)) int.TryParse(pv, out pushPx);
-        string cv;
-        clipEnabled = kv.TryGetValue("clip", out cv) && cv == "1";
     }
 
     private static string OppositeDir(string d)
@@ -382,7 +369,6 @@ internal static class Program
             sb.AppendLine("links=" + (configKv.TryGetValue("links", out v) ? v : ""));
             sb.AppendLine("colors=" + (configKv.TryGetValue("colors", out v) ? v : ""));
             sb.AppendLine("push=" + (configKv.TryGetValue("push", out v) ? v : ""));
-            sb.AppendLine("clip=" + (configKv.TryGetValue("clip", out v) ? v : ""));
             File.WriteAllText(path, sb.ToString());
         }
         catch (Exception) { }
@@ -582,89 +568,6 @@ internal static class Program
         Log("レイアウト: 割り当てを受けました");
     }
 
-    // ---- クリップボード共有(テキストのみ・上限64KB) ----
-
-    private static void HandleClipChunk(string[] args, string from)
-    {
-        if (!clipEnabled || args.Length < 4) return;
-        int idx, total;
-        if (!int.TryParse(args[1], out idx) || !int.TryParse(args[2], out total)) return;
-        if (total < 1 || total > 200 || idx < 0 || idx >= total) return;
-        string key = from + "|" + args[0];
-        lock (clipLock)
-        {
-            ClipAsm asm;
-            if (!clipAsm.TryGetValue(key, out asm)) { asm = new ClipAsm(); asm.Total = total; clipAsm[key] = asm; }
-            asm.Parts[idx] = args[3];
-            List<string> dead = new List<string>();
-            foreach (KeyValuePair<string, ClipAsm> p in clipAsm)
-                if ((DateTime.UtcNow - p.Value.First).TotalSeconds > 10) dead.Add(p.Key);
-            foreach (string k in dead) clipAsm.Remove(k);
-            if (asm.Parts.Count < asm.Total) return;
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < asm.Total; i++)
-            {
-                string part;
-                if (!asm.Parts.TryGetValue(i, out part)) return;
-                sb.Append(part);
-            }
-            clipAsm.Remove(key);
-            string text;
-            try { text = Encoding.UTF8.GetString(Convert.FromBase64String(sb.ToString())); }
-            catch (Exception) { return; }
-            if (text.Length == 0 || Encoding.UTF8.GetByteCount(text) > 65536) return;
-            pendingClip = text;
-        }
-    }
-
-    private static void SendClipText(string text)
-    {
-        string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(text));
-        int chunk = 800;
-        int total = (b64.Length + chunk - 1) / chunk;
-        string tid = myId + "-" + (++clipSendCounter);
-        List<string> targets = new List<string>(peers.Keys);
-        foreach (string peer in targets)
-        {
-            for (int i = 0; i < total; i++)
-            {
-                int len = Math.Min(chunk, b64.Length - i * chunk);
-                SendFast("clip " + peer + " " + tid + " " + i + " " + total + " " + b64.Substring(i * chunk, len));
-            }
-        }
-        Log("クリップボード共有: テキストを送りました");
-    }
-
-    /// トレイのタイマー(UIスレッド)から 500ms ごとに呼ばれる
-    private static void PollClipboard()
-    {
-        string pending = null;
-        lock (clipLock) { pending = pendingClip; pendingClip = null; }
-        if (pending != null)
-        {
-            try
-            {
-                Clipboard.SetText(pending);
-                clipAppliedSeq = GetClipboardSequenceNumber();
-                clipAppliedValid = true;
-                Log("クリップボード共有: テキストを受け取りました");
-            }
-            catch (Exception) { }
-        }
-        if (searching && (DateTime.Now - searchAt).TotalSeconds > 30) { searching = false; PressKey(0x1B); }
-        uint seq = GetClipboardSequenceNumber();
-        if (!clipEnabled) { lastClipSeq = seq; clipSeqReady = true; return; }
-        if (!clipSeqReady) { lastClipSeq = seq; clipSeqReady = true; return; }
-        if (seq == lastClipSeq) return;
-        lastClipSeq = seq;
-        if (clipAppliedValid && seq == clipAppliedSeq) return; // 自分が受けて入れたもの
-        string text = null;
-        try { if (Clipboard.ContainsText()) text = Clipboard.GetText(); } catch (Exception) { }
-        if (string.IsNullOrEmpty(text)) return;
-        if (Encoding.UTF8.GetByteCount(text) > 65536) return;
-        SendClipText(text);
-    }
-
     // カーソルの現在地を全マシンへ知らせる(自分が保持者になったとき)
     private static void SendAtSelf()
     {
@@ -829,7 +732,6 @@ internal static class Program
         string[] args = new string[rest.Length - 1];
         Array.Copy(rest, 1, args, 0, args.Length);
 
-        if (kind == "clip") { HandleClipChunk(args, from); return; }
         if (kind == "assign") { HandleAssign(args); return; }
         if (kind == "at") { if (args.Length >= 1) cursorAt = args[0]; return; }
         if (kind == "swopen") { OpenSwitchLocal(); return; }
@@ -1042,7 +944,6 @@ internal static class Program
     {
         private readonly NotifyIcon icon;
         private readonly ToolStripMenuItem cursorItem;
-        private readonly System.Windows.Forms.Timer clipTimer;
 
         public TrayContext()
         {
@@ -1057,17 +958,6 @@ internal static class Program
                 cursorItem.Text = (cursorAt == null || cursorAt == myId) ? "カーソル: 自分" : "カーソル: " + PeerName(cursorAt);
             };
             menu.Items.Add("自分の ID: " + myId, null, null).Enabled = false;
-            ToolStripMenuItem clipItem = new ToolStripMenuItem("クリップボード共有");
-            clipItem.Checked = clipEnabled;
-            clipItem.Click += delegate
-            {
-                clipEnabled = !clipEnabled;
-                clipItem.Checked = clipEnabled;
-                configKv["clip"] = clipEnabled ? "1" : "0";
-                SaveConfig();
-                Log("クリップボード共有: " + (clipEnabled ? "オン" : "オフ"));
-            };
-            menu.Items.Add(clipItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("終了", null, delegate { Exit(); });
             InstallSwitchHooks();
@@ -1078,10 +968,6 @@ internal static class Program
             icon.ContextMenuStrip = menu;
             icon.Visible = true;
             icon.DoubleClick += delegate { ShowLogWindow(); };
-            clipTimer = new System.Windows.Forms.Timer();
-            clipTimer.Interval = 500;
-            clipTimer.Tick += delegate { PollClipboard(); };
-            clipTimer.Start();
         }
 
         private void Exit()

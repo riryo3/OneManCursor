@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-54"
+let buildTag = "Build 20261031-55"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1802,6 +1802,52 @@ enum LayoutStore {
                 }
             }
             result[id] = mine
+        }
+        // 接合部の隙間: 複数のマシンが集まる角(T字・十字の接合点)では、その点を共有する
+        // リンクの端を両側へ少し(自分の辺の2%)ずらして「渡れない帯」を作る。
+        // 角の取り合いでカーソルが行方不明になるのを防ぐため
+        let gapR = 0.02
+        struct EndRef { let owner: String; let idx: Int; let isHi: Bool; let coord: Double; let line: Double }
+        var ends: [EndRef] = []
+        for (id, links) in result {
+            guard let r = rects[id] else { continue }
+            for (i, lk) in links.enumerated() {
+                switch lk.dir {
+                case .right, .left:
+                    let line = Double(lk.dir == .right ? r.maxX : r.minX)
+                    ends.append(EndRef(owner: id, idx: i, isHi: false, coord: Double(r.minY) + lk.start * Double(r.height), line: line))
+                    ends.append(EndRef(owner: id, idx: i, isHi: true, coord: Double(r.minY) + lk.end * Double(r.height), line: line))
+                case .down, .up:
+                    let line = Double(lk.dir == .down ? r.maxY : r.minY)
+                    ends.append(EndRef(owner: id, idx: i, isHi: false, coord: Double(r.minX) + lk.start * Double(r.width), line: line))
+                    ends.append(EndRef(owner: id, idx: i, isHi: true, coord: Double(r.minX) + lk.end * Double(r.width), line: line))
+                }
+            }
+        }
+        var marked = Set<String>()
+        for a in ends {
+            for b in ends where b.owner != a.owner && b.isHi != a.isHi {
+                if abs(a.coord - b.coord) <= 24 && abs(a.line - b.line) <= 50 {
+                    marked.insert("\(a.owner)|\(a.idx)|\(a.isHi ? "h" : "l")")
+                }
+            }
+        }
+        if !marked.isEmpty {
+            for e in ends where marked.contains("\(e.owner)|\(e.idx)|\(e.isHi ? "h" : "l")") {
+                guard let r = rects[e.owner], var links = result[e.owner], e.idx < links.count else { continue }
+                var lk = links[e.idx]
+                let horiz = lk.dir == .up || lk.dir == .down
+                let len = Double(horiz ? r.width : r.height)
+                let origin = Double(horiz ? r.minX : r.minY)
+                let newCoord = e.isHi ? e.coord - gapR * len : e.coord + gapR * len
+                let ratio = (newCoord - origin) / len
+                if e.isHi { lk.end = min(lk.end, ratio) } else { lk.start = max(lk.start, ratio) }
+                links[e.idx] = lk
+                result[e.owner] = links
+            }
+            for id in Array(result.keys) {
+                result[id] = (result[id] ?? []).filter { $0.end - $0.start >= 0.04 }
+            }
         }
         return result
     }

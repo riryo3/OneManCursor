@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-46"
+let buildTag = "Build 20261030-47"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2724,6 +2724,7 @@ final class SearchSync {
     private(set) var receiving = false  // 合図を受けて検索を開いている側
     private var timer: Timer?
     private var loggedApply = false
+    private var openedAt = Date.distantPast
     var onNote: ((String) -> Void)?
 
     func start() {
@@ -2796,7 +2797,18 @@ final class SearchSync {
     /// Spotlight が開いているか(画面上のウィンドウの持ち主で見る)
     private func spotlightOpen() -> Bool {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
-        return list.contains { ($0[kCGWindowOwnerName as String] as? String) == "Spotlight" }
+        return list.contains { ($0[kCGWindowOwnerName as String] as? String)?.range(of: "Spotlight", options: .caseInsensitive) != nil }
+    }
+
+    /// 画面上のウィンドウの持ち主一覧(切り分け用)
+    private func windowOwners() -> String {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return "?" }
+        var seen: [String] = []
+        for w in list {
+            if let n = w[kCGWindowOwnerName as String] as? String, !seen.contains(n) { seen.append(n) }
+            if seen.count >= 12 { break }
+        }
+        return seen.joined(separator: ",")
     }
 
     /// 起点の検索終了: 他端末の検索も閉じる
@@ -2813,9 +2825,15 @@ final class SearchSync {
         guard enabled, !origin, !receiving else { return }
         receiving = true
         loggedApply = false
+        openedAt = Date()
         armTimer()
         NetLog.shared.log("検索連動: 受け側開始")
         postKeyCode(49, flags: .maskCommand)
+        // 少し待って、Spotlight が本当に開いたかをログに残す(切り分け用)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self = self, self.receiving else { return }
+            NetLog.shared.log("検索連動: Spotlight 表示確認 = \(self.spotlightOpen())")
+        }
     }
 
     func receiveQuery(_ b64: String) {
@@ -2855,7 +2873,10 @@ final class SearchSync {
     func applyRemoteKey(kind: String, args: [String]) {
         guard receiving, args.count == 2, let code = UInt16(args[0]), let flagsRaw = UInt64(args[1]) else { return }
         guard spotlightOpen() else {
-            NetLog.shared.log("検索連動: Spotlight が開いていないため打鍵を止めます (最前面=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"))")
+            // 開ききる前(受け側開始から2秒以内で、まだ1件も再現できていない)に届いたキーは、
+            // Spotlight の表示待ちとして捨てるだけにする(連動は止めない)
+            if !loggedApply, Date().timeIntervalSince(openedAt) < 2.0 { return }
+            NetLog.shared.log("検索連動: Spotlight が開いていないため打鍵を止めます (最前面=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?") / 画面の持ち主=\(windowOwners()))")
             receiving = false
             disarm()
             return

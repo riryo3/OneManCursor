@@ -46,6 +46,11 @@ if [ "$1" = "dist" ]; then
     rm -rf dist
     mkdir -p dist
     cp -R "$APP" "dist/$APP"
+    # 配布用はアイコンを標準(ビルド番号なし)に戻す。通常ビルドの番号入りアイコンは
+    # 開発中の版の見分け用なので、安定版として配る方には入れない
+    DIST_ICONSET="$(mktemp -d)/AppIcon.iconset"
+    /tmp/onemancursor_make_icon "$DIST_ICONSET"
+    iconutil -c icns "$DIST_ICONSET" -o "dist/$APP/Contents/Resources/AppIcon.icns"
     codesign --force --deep --sign - "dist/$APP"
     if codesign -dv "dist/$APP" 2>&1 | grep -q "Apple Development"; then
         echo "エラー: 配布用アプリに Apple Development 署名が残っています"

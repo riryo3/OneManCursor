@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-35"
+let buildTag = "Build 20261030-36"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2333,9 +2333,9 @@ func switchKeyCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent
     // MCキーなど特殊キー(システム定義イベント)の足跡をログに残すための聞き専用タップ
     if type.rawValue == 14, let ns = NSEvent(cgEvent: event) {
         let d1 = ns.data1
-        NetLog.shared.log("システムキー: subtype=\(ns.subtype.rawValue) keyType=\((d1 >> 16) & 0xFFFF) state=\((d1 >> 8) & 0xFF)")
-        // subtype=7 が MCキー(F3)の署名だった(実測: 押すたびに届き、メディアキーは subtype=8 で別物)
-        if ns.subtype.rawValue == 7 { SwitchSync.shared.noteSystemKeyCandidate() }
+        // subtype=7 はクリックのたびにも出るイベントで、F3 の署名ではなかった(2026-10-30 実測で判明)。
+        // 検知には使わず、data1/data2 の全量をログに残して署名の特定を続ける
+        NetLog.shared.log("システムキー: subtype=\(ns.subtype.rawValue) data1=0x\(String(d1, radix: 16)) data2=0x\(String(ns.data2, radix: 16))")
     }
     return Unmanaged.passUnretained(event)
 }
@@ -2383,24 +2383,6 @@ final class SwitchSync {
     func noteOpenKey() {
         guard enabled else { return }
         if switching { decide() } else { noteLocalOpen() }
-    }
-
-    private var lastSysKeyAt: Date?
-    private let startedAt = Date()
-
-    /// MCキー(F3)は標準キーにならず、特殊キー(システム定義イベント subtype=7)として届く。
-    /// 押下と離上の区別が付かずペアで届くため、短時間の連続イベントは1回の押下として扱う。
-    /// 起動直後は別の要因でも出ることがあるため、最初の5秒は無視する
-    func noteSystemKeyCandidate() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.enabled else { return }
-            let now = Date()
-            if now.timeIntervalSince(self.startedAt) < 5 { return }
-            if let last = self.lastSysKeyAt, now.timeIntervalSince(last) < 1.5 { return }
-            self.lastSysKeyAt = now
-            NetLog.shared.log("MC検知: システムキー")
-            self.noteOpenKey()
-        }
     }
 
     /// トラックパッドの4本指縦スワイプ(Engine が検知): 上下とも一覧を開く操作。

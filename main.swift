@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-36"
+let buildTag = "Build 20261030-37"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2355,7 +2355,10 @@ final class SwitchSync {
         guard observer == nil else { return }
         observer = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.noteActivation() }
+        ) { [weak self] note in
+            let app = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.localizedName ?? "?"
+            self?.noteActivation(app: app)
+        }
         // MCキーなどの特殊キーの足跡を取る(聞き専用タップ)
         let sysMask = CGEventMask(1) << 14
         if let tap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap, options: .listenOnly, eventsOfInterest: sysMask, callback: switchKeyCallback, userInfo: nil) {
@@ -2366,9 +2369,10 @@ final class SwitchSync {
     }
 
     /// 一覧が開いている間にアプリが切り替わった = そこで確定した
-    private func noteActivation() {
+    private func noteActivation(app: String) {
         guard enabled, switching else { return }
-        decide()
+        NetLog.shared.log("アプリ切替を検知: \(app)")
+        decide(reason: "アプリ切替(\(app))")
     }
 
     /// 自分が Mission Control を開いた: フラグを立て、他端末へ「開く」合図を送る
@@ -2382,7 +2386,8 @@ final class SwitchSync {
     /// Ctrl+↑ や MCキー: 開いていなければ「開いた」合図、開いているときは確定(トグルで閉じた)
     func noteOpenKey() {
         guard enabled else { return }
-        if switching { decide() } else { noteLocalOpen() }
+        NetLog.shared.log("MC検知: noteOpenKey (switching=\(switching))")
+        if switching { decide(reason: "キーのトグル") } else { noteLocalOpen() }
     }
 
     /// トラックパッドの4本指縦スワイプ(Engine が検知): 上下とも一覧を開く操作。
@@ -2391,7 +2396,7 @@ final class SwitchSync {
         guard enabled else { return }
         NetLog.shared.log("MC検知: 4本指スワイプ (up=\(up))")
         if switching {
-            if !up { decide() }
+            if !up { decide(reason: "下スワイプ") }
         } else {
             noteLocalOpen()
         }
@@ -2400,7 +2405,7 @@ final class SwitchSync {
     /// 自分が Esc で一覧を閉じた: 確定と同じ扱いで、他端末の一覧も閉じさせる
     func noteLocalEsc() {
         guard enabled, switching else { return }
-        decide()
+        decide(reason: "Esc")
     }
 
     /// 合図を受けて自分の Mission Control を開く
@@ -2420,8 +2425,9 @@ final class SwitchSync {
         postKey(53, flags: [])
     }
 
-    private func decide() {
+    private func decide(reason: String) {
         guard switching else { return }
+        NetLog.shared.log("確定: 理由=\(reason)")
         setFlag(false)
         broadcast("swdone")
         onNote?("確定を送りました")

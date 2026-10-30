@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-40"
+let buildTag = "Build 20261030-41"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2381,6 +2381,7 @@ final class SwitchSync {
     private(set) var switching = false
     private var timer: Timer?
     private var observer: NSObjectProtocol?
+    private var lastFlagChangeAt = Date.distantPast   // 診断用: フラグが最後に変わった時刻
     var onNote: ((String) -> Void)?
 
     func start() {
@@ -2402,9 +2403,14 @@ final class SwitchSync {
 
     /// 一覧が開いている間にアプリが切り替わった = そこで確定した
     private func noteActivation(app: String) {
-        guard enabled, switching else { return }
-        NetLog.shared.log("アプリ切替を検知: \(app)")
-        decide(reason: "アプリ切替(\(app))")
+        if switching {
+            NetLog.shared.log("アプリ切替を検知: \(app)")
+            guard enabled else { return }
+            decide(reason: "アプリ切替(\(app))")
+        } else if Date().timeIntervalSince(lastFlagChangeAt) < 90 {
+            // 確定しなかったアプリ切替も、連動の直後しばらくは記録する(切り分け用)
+            NetLog.shared.log("アプリ切替を検知: \(app) (switching=false のため確定せず)")
+        }
     }
 
     /// 自分が Mission Control を開いた: フラグを立て、他端末へ「開く」合図を送る
@@ -2481,10 +2487,11 @@ final class SwitchSync {
 
     private func setFlag(_ on: Bool) {
         switching = on
+        lastFlagChangeAt = Date()
         timer?.invalidate()
         timer = nil
         if on {
-            let t = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
+            let t = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
                 self?.setFlag(false)
             }
             RunLoop.main.add(t, forMode: .common)

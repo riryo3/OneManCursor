@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-51"
+let buildTag = "Build 20261030-52"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2890,18 +2890,12 @@ final class SearchSync {
     }
 
     /// 自分の Spotlight を閉じる。Spotlight の Esc は「1回目=検索文字の消去、2回目=閉じる」
-    /// という仕様なので、フォーカスが Spotlight に残っている間は Esc を段階的に送り、
-    /// 最後の手段として、開くときに効いた ⌘+Space(トグル)で閉じる
+    /// という仕様なので、人間が2回押すのと同じく、間隔を空けて無条件に2回送る。
+    /// 開いているかの外部判定(AX のフォーカス先など)は受け側では当てにならないため使わない
     private func closeLocal() {
         SwitchSync.shared.postKey(53, flags: [])
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            guard let self = self, self.spotlightFocused() else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             SwitchSync.shared.postKey(53, flags: [])
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-                guard let self = self, self.spotlightFocused() else { return }
-                NetLog.shared.log("検索連動: Esc で閉じなかったため ⌘+Space で閉じます")
-                self.postKeyCode(49, flags: .maskCommand)
-            }
         }
     }
 

@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-29"
+let buildTag = "Build 20261030-30"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1225,6 +1225,9 @@ final class CursorShare {
             status("レイアウト： 割り当てを受けました")
         case "at":
             if let holder = rest.first { cursorAtID = holder }
+        case "mother":
+            UserDefaults.standard.set(from, forKey: "mothershipID")
+            status("母艦は \(peerName(from)) になりました")
         case "swopen":
             SwitchSync.shared.openLocal()
         case "swdone":
@@ -1542,9 +1545,11 @@ final class EdgeGlow {
         }
     }
 
-    /// メインスレッド上なら即実行し、show/hide の順序の入れ替わりを防ぐ
+    /// 必ずメインキュー経由で実行する。手元経路はイベントタップ(メインスレッド)から
+    /// 呼ばれるため即実行すると、保持中経路(受信キュー→メインキュー)と実行文脈が
+    /// 食い違い、表示が不安定になる疑いがあるため、経路を揃える
     private func onMain(_ work: @escaping () -> Void) {
-        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
+        DispatchQueue.main.async(execute: work)
     }
 
     private func ensureWindow() {
@@ -1726,6 +1731,8 @@ enum LayoutStore {
     /// 配置を保存し、自分のリンクへ反映し、他の全マシンへ割り当てを送る
     static func apply(pos: [String: (x: Double, y: Double)]) {
         savePos(pos)
+        // 母艦が決まっているときは、母艦以外は配布しない(古い配置での上書き事故を防ぐ)
+        if let mid = UserDefaults.standard.string(forKey: "mothershipID"), mid != LinkNet.machineID { return }
         let all = derive(rects: rects(pos: pos))
         CursorShare.shared.setLinks(all[LinkNet.machineID] ?? [])
         for (id, lks) in all where id != LinkNet.machineID { sendAssign(to: id, links: lks) }
@@ -1753,6 +1760,11 @@ enum LayoutStore {
         let now = Date()
         if let prev = prevSeen, now.timeIntervalSince(prev) < 25 { return }
         if let last = lastAssign[id], now.timeIntervalSince(last) < 60 { return }
+        // 母艦が決まっているときは、母艦以外は送り直さない。自分が母艦なら母艦であることも伝える
+        if let mid = UserDefaults.standard.string(forKey: "mothershipID"), mid != LinkNet.machineID { return }
+        if UserDefaults.standard.string(forKey: "mothershipID") == LinkNet.machineID {
+            LinkNet.sendFast("mother \(id)")
+        }
         let all = derive(rects: rects(pos: pos))
         sendAssign(to: id, links: all[id] ?? [])
     }
@@ -2099,20 +2111,26 @@ final class LayoutWindowController: NSWindowController {
         let snapBox = NSButton(checkboxWithTitle: "スナップ（辺・中央線に吸着）", target: self, action: #selector(toggleSnap(_:)))
         let idButton = NSButton(title: "画面で確認", target: self, action: #selector(identifyScreens))
         idButton.bezelStyle = .rounded
+        let motherButton = NSButton(title: "この端末を母艦にする", target: self, action: #selector(becomeMothership))
+        motherButton.bezelStyle = .rounded
         snapBox.state = canvas.snapEnabled ? .on : .off
         let hint = NSTextField(labelWithString: "辺がくっつくと隣になります。タイル右上の丸で、そのマシンの色を変更できます")
         hint.textColor = .secondaryLabelColor
         hint.font = .systemFont(ofSize: 11)
-        let bar = NSStackView(views: [snapBox, idButton, hint])
+        // ボタン類と説明文を同じ行に入れると幅が足りずボタンが消えることがあるため、2段にする
+        let bar = NSStackView(views: [snapBox, idButton, motherButton])
         bar.orientation = .horizontal
         bar.spacing = 16
-        bar.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
-        let root = NSStackView(views: [bar, canvas])
+        bar.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 4, right: 12)
+        let hintBar = NSStackView(views: [hint])
+        hintBar.orientation = .horizontal
+        hintBar.edgeInsets = NSEdgeInsets(top: 0, left: 12, bottom: 8, right: 12)
+        let root = NSStackView(views: [bar, hintBar, canvas])
         root.orientation = .vertical
         root.spacing = 0
         root.distribution = .fill
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 520), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        window.title = "レイアウト編集"
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 548), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.title = mothershipTitle()
         window.contentView = root
         window.minSize = NSSize(width: 480, height: 400)
         self.window = window
@@ -2129,6 +2147,22 @@ final class LayoutWindowController: NSWindowController {
             LinkNet.sendFast("identify \(pid)")
         }
         IdentifyGlow.shared.showSelf()
+    }
+
+    /// この端末を母艦(レイアウトの配布元)にする。以後は母艦以外は割り当てを配らない
+    @objc func becomeMothership() {
+        UserDefaults.standard.set(LinkNet.machineID, forKey: "mothershipID")
+        for pid in LinkNet.peers.keys where pid != LinkNet.machineID {
+            LinkNet.sendFast("mother \(pid)")
+        }
+        LayoutStore.apply(pos: LayoutStore.loadPos())
+        window?.title = mothershipTitle()
+    }
+
+    private func mothershipTitle() -> String {
+        guard let mid = UserDefaults.standard.string(forKey: "mothershipID") else { return "レイアウト編集" }
+        if mid == LinkNet.machineID { return "レイアウト編集（この端末が母艦）" }
+        return "レイアウト編集（母艦: \(LayoutStore.name(of: mid)))"
     }
 }
 

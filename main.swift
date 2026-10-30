@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-45"
+let buildTag = "Build 20261030-46"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1290,6 +1290,8 @@ final class CursorShare {
             if (kind == "kd" || kind == "ku" || kind == "fl"), SearchSync.shared.receiving, !holding, forwardTo == nil {
                 // 検索の連動: 検索を開いている間に届いた打鍵は、検索への入力として再現する
                 SearchSync.shared.applyRemoteKey(kind: kind, args: rest)
+            } else if (kind == "kd" || kind == "ku" || kind == "fl"), SearchSync.shared.receiving {
+                if kind == "kd" { NetLog.shared.log("検索連動: セッション中のため打鍵を適用できません") }
             } else if holding {
                 apply(kind, args: rest)
             } else if let fwd = forwardTo {
@@ -2721,6 +2723,7 @@ final class SearchSync {
     private(set) var origin = false     // 自分が起点(打鍵を送る側)
     private(set) var receiving = false  // 合図を受けて検索を開いている側
     private var timer: Timer?
+    private var loggedApply = false
     var onNote: ((String) -> Void)?
 
     func start() {
@@ -2809,7 +2812,9 @@ final class SearchSync {
     func receiveOpen() {
         guard enabled, !origin, !receiving else { return }
         receiving = true
+        loggedApply = false
         armTimer()
+        NetLog.shared.log("検索連動: 受け側開始")
         postKeyCode(49, flags: .maskCommand)
     }
 
@@ -2844,13 +2849,20 @@ final class SearchSync {
     }
 
     /// 受け側: 起点から届いた打鍵(kd/ku/fl)をそのまま再現する。
-    /// 自分の検索が最前面でなければ、閉じられたとみなして事故防止のため止める
+    /// Spotlight が開いていなければ、閉じられたとみなして事故防止のため止める。
+    /// 開いているかの判定は、起点の Esc 判断でも使っている「Spotlight のウィンドウがあるか」で行う
+    /// (最前面アプリの判定は、Spotlight 表示中でも手前アプリを返してしまうため使わない)
     func applyRemoteKey(kind: String, args: [String]) {
         guard receiving, args.count == 2, let code = UInt16(args[0]), let flagsRaw = UInt64(args[1]) else { return }
-        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Spotlight" else {
+        guard spotlightOpen() else {
+            NetLog.shared.log("検索連動: Spotlight が開いていないため打鍵を止めます (最前面=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"))")
             receiving = false
             disarm()
             return
+        }
+        if !loggedApply {
+            loggedApply = true
+            NetLog.shared.log("検索連動: 打鍵の再現を開始しました")
         }
         if let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: kind != "ku") {
             e.flags = CGEventFlags(rawValue: flagsRaw)

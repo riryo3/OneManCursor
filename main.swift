@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-47"
+let buildTag = "Build 20261030-48"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2775,7 +2775,7 @@ final class SearchSync {
         guard origin else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             guard let self = self, self.origin else { return }
-            if self.spotlightOpen() { return }  // 変換の取消だった: 何もしない
+            if self.spotlightFocused() { return }  // 変換の取消だった: 何もしない
             self.noteLocalEnd()
         }
     }
@@ -2794,21 +2794,17 @@ final class SearchSync {
         sendAll(kind, "\(kc) \(event.flags.rawValue)")
     }
 
-    /// Spotlight が開いているか(画面上のウィンドウの持ち主で見る)
-    private func spotlightOpen() -> Bool {
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
-        return list.contains { ($0[kCGWindowOwnerName as String] as? String)?.range(of: "Spotlight", options: .caseInsensitive) != nil }
-    }
-
-    /// 画面上のウィンドウの持ち主一覧(切り分け用)
-    private func windowOwners() -> String {
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return "?" }
-        var seen: [String] = []
-        for w in list {
-            if let n = w[kCGWindowOwnerName as String] as? String, !seen.contains(n) { seen.append(n) }
-            if seen.count >= 12 { break }
-        }
-        return seen.joined(separator: ",")
+    /// Spotlight がまだ開いているか(フォーカスのある要素の持ち主で見る)。
+    /// Spotlight のウィンドウは CGWindowList から見えないため、ウィンドウ一覧では判定できない
+    private func spotlightFocused() -> Bool {
+        guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.Spotlight" }) else { return false }
+        let sys = AXUIElementCreateSystemWide()
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &ref) == .success,
+              let el = ref else { return false }
+        var pid: pid_t = 0
+        AXUIElementGetPid(el as! AXUIElement, &pid)
+        return pid == app.processIdentifier
     }
 
     /// 起点の検索終了: 他端末の検索も閉じる
@@ -2829,11 +2825,6 @@ final class SearchSync {
         armTimer()
         NetLog.shared.log("検索連動: 受け側開始")
         postKeyCode(49, flags: .maskCommand)
-        // 少し待って、Spotlight が本当に開いたかをログに残す(切り分け用)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            guard let self = self, self.receiving else { return }
-            NetLog.shared.log("検索連動: Spotlight 表示確認 = \(self.spotlightOpen())")
-        }
     }
 
     func receiveQuery(_ b64: String) {
@@ -2867,20 +2858,11 @@ final class SearchSync {
     }
 
     /// 受け側: 起点から届いた打鍵(kd/ku/fl)をそのまま再現する。
-    /// Spotlight が開いていなければ、閉じられたとみなして事故防止のため止める。
-    /// 開いているかの判定は、起点の Esc 判断でも使っている「Spotlight のウィンドウがあるか」で行う
-    /// (最前面アプリの判定は、Spotlight 表示中でも手前アプリを返してしまうため使わない)
+    /// Spotlight が開いているかは外部から判定できない(macOS 27 では Spotlight のウィンドウが
+    /// CGWindowList にも最前面アプリにも現れない)ため、判定はせず、連動中(receiving)であることを
+    /// もって再現する。連動は sdone / アプリ切替 / 30秒タイムアウトで必ず終わる
     func applyRemoteKey(kind: String, args: [String]) {
         guard receiving, args.count == 2, let code = UInt16(args[0]), let flagsRaw = UInt64(args[1]) else { return }
-        guard spotlightOpen() else {
-            // 開ききる前(受け側開始から2秒以内で、まだ1件も再現できていない)に届いたキーは、
-            // Spotlight の表示待ちとして捨てるだけにする(連動は止めない)
-            if !loggedApply, Date().timeIntervalSince(openedAt) < 2.0 { return }
-            NetLog.shared.log("検索連動: Spotlight が開いていないため打鍵を止めます (最前面=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?") / 画面の持ち主=\(windowOwners()))")
-            receiving = false
-            disarm()
-            return
-        }
         if !loggedApply {
             loggedApply = true
             NetLog.shared.log("検索連動: 打鍵の再現を開始しました")

@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-49"
+let buildTag = "Build 20261030-50"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2755,7 +2755,7 @@ final class SearchSync {
     }
     private func timeout() {
         if origin { origin = false; sendAll("sdone") }
-        if receiving { receiving = false; postKeyCode(53) }
+        if receiving { receiving = false; postEsc() }
         disarm()
     }
 
@@ -2854,7 +2854,7 @@ final class SearchSync {
         guard receiving else { return }
         receiving = false
         disarm()
-        postKeyCode(53)
+        postEsc()
     }
 
     /// 受け側: 起点から届いた打鍵(kd/ku/fl)をそのまま再現する。
@@ -2885,6 +2885,24 @@ final class SearchSync {
                     CursorShare.markSynthetic(e)
                     e.post(tap: .cghidEventTap)
                 }
+            }
+        }
+    }
+
+    /// Esc を本物らしく送る(実flags + 押下と解放の間隔)。
+    /// 薄い合成 Esc(間隔なし・素の flags)は Spotlight に無視されることがある
+    private func postEsc() {
+        let f = CGEventFlags.maskNonCoalesced
+        if let d = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true) {
+            d.flags = f
+            CursorShare.markSynthetic(d)
+            d.post(tap: .cghidEventTap)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            if let u = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: false) {
+                u.flags = f
+                CursorShare.markSynthetic(u)
+                u.post(tap: .cghidEventTap)
             }
         }
     }

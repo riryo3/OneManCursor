@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-33"
+let buildTag = "Build 20261030-34"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -102,6 +102,7 @@ final class Engine {
 
     private var session = false
     private var lockedCount = 0       // セッション中に確認した最大の指の数(2 か 3)
+    private var lockStableSince: Double = 0   // 本数が最後に増えた時刻(遅れて触れる指を待つため)
     private var startX: Float = 0, startY: Float = 0
     private var startT: Double = 0
     private var fired = false
@@ -121,11 +122,11 @@ final class Engine {
 
         if !session {
             guard n >= 2 else { return }
-            session = true; lockedCount = n
+            session = true; lockedCount = n; lockStableSince = timestamp
             startX = cx; startY = cy; startT = timestamp; fired = false
             return
         }
-        if n > lockedCount { lockedCount = n }
+        if n > lockedCount { lockedCount = n; lockStableSince = timestamp }
         guard !fired, n >= 2 else { return }
         let dx = cx - startX, dy = cy - startY
         let elapsed = timestamp - startT
@@ -138,7 +139,9 @@ final class Engine {
             }
         } else if lockedCount == 3 {
             // 縦: 下へ = 上の階層、上へ = 開く
-            if abs(dy) >= vertMin, abs(dy) >= 2 * abs(dx) {
+            // 4本目が遅れて触れることがあるため、本数が安定するまでは発火しない。
+            // 安定を待たないと、4本指スワイプを3本指と誤認して横取りしてしまう
+            if timestamp - lockStableSince >= graceTime, abs(dy) >= vertMin, abs(dy) >= 2 * abs(dx) {
                 fire(dy > 0 ? .open : .parent)
             }
         } else if lockedCount == 4 {

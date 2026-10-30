@@ -41,7 +41,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-53";
+    private const string BuildTag = "Build 20261031-54";
 
     private static string SpecId(string spec)
     {
@@ -100,6 +100,7 @@ internal static class Program
     // 切り替え画面の連動(タスクビュー / Alt+Tab)
     private static bool switching = false;
     private static bool searching = false;
+    private static bool soloMode = false;   // 単独モード: 届いたカーソルを受け取らず送り返す
     private static DateTime searchAt = DateTime.MinValue;
     private static DateTime switchAt = DateTime.MinValue;
     private static bool winTabArmed = false;
@@ -344,6 +345,8 @@ internal static class Program
             }
         }
         if (kv.TryGetValue("push", out pv)) int.TryParse(pv, out pushPx);
+        string soloV;
+        if (kv.TryGetValue("solo", out soloV)) soloMode = (soloV == "1");
     }
 
     private static string OppositeDir(string d)
@@ -370,6 +373,7 @@ internal static class Program
             sb.AppendLine("links=" + (configKv.TryGetValue("links", out v) ? v : ""));
             sb.AppendLine("colors=" + (configKv.TryGetValue("colors", out v) ? v : ""));
             sb.AppendLine("push=" + (configKv.TryGetValue("push", out v) ? v : ""));
+            sb.AppendLine("solo=" + (soloMode ? "1" : ""));
             File.WriteAllText(path, sb.ToString());
         }
         catch (Exception) { }
@@ -856,6 +860,13 @@ internal static class Program
             if (holding || forwardTo != null || args.Length < 1) return;
             double ratio;
             if (!double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ratio)) ratio = 0.5;
+            if (soloMode)
+            {
+                // 単独モード: 受け取らず、そのまま送り返す(送り手は「手元に戻ってきた」として処理する)
+                SendFast("leave " + from + " " + args[0]);
+                Log("単独モード: " + PeerName(from) + " からのカーソルを返送しました");
+                return;
+            }
             holding = true;
             cameFrom = from;
             string d = null;
@@ -1029,6 +1040,22 @@ internal static class Program
                 cursorItem.Text = (cursorAt == null || cursorAt == myId) ? "カーソル: 自分" : "カーソル: " + PeerName(cursorAt);
             };
             menu.Items.Add("自分の ID: " + myId, null, null).Enabled = false;
+            ToolStripMenuItem soloItem = new ToolStripMenuItem("単独モード");
+            soloItem.Checked = soloMode;
+            soloItem.Click += delegate
+            {
+                soloMode = !soloMode;
+                soloItem.Checked = soloMode;
+                if (soloMode && holding && cameFrom != null)
+                {
+                    SendFast("leave " + cameFrom + " 0.5");
+                    holding = false; cameFrom = null;
+                    Log("単独モード: カーソルを返しました");
+                }
+                Log(soloMode ? "単独モード: オン" : "単独モード: オフ");
+                SaveConfig();
+            };
+            menu.Items.Add(soloItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("終了", null, delegate { Exit(); });
             InstallSwitchHooks();

@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-53"
+let buildTag = "Build 20261031-54"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -704,6 +704,27 @@ final class CursorShare {
 
     // 画面移動の調整(メニュー「画面移動の調整」で変更)
     /// 端の押し込み量(px)。0 = 端に触れたら即移動
+    /// 単独モード: カーソルを他のマシンへ渡さず、届いたカーソルも送り返す(画面端で迷子にしないため)。端末ごとに設定する
+    var soloMode: Bool {
+        get { UserDefaults.standard.bool(forKey: "soloMode") }
+        set { UserDefaults.standard.set(newValue, forKey: "soloMode") }
+    }
+
+    /// 単独モードに入る瞬間の後始末: 持っているカーソルは持ち主へ返し、渡しているセッションは畳む
+    func enforceSolo() {
+        if holding, let from = cameFrom {
+            LinkNet.sendFast("leave \(from) 0.5")
+            holding = false
+            cameFrom = nil
+            EdgeGlow.shared.hide()
+            status("単独モード： カーソルを返しました")
+        } else if sending || forwardTo != nil {
+            LinkNet.sendReset()
+            resetSession()
+            status("単独モード： セッションを終了しました")
+        }
+    }
+
     static var pushPx: Int { UserDefaults.standard.integer(forKey: "edgePushPx") }
     /// 起点が送るカーソル移動の倍率。未設定(0)なら 1
     static var moveMult: Double {
@@ -1068,6 +1089,7 @@ final class CursorShare {
 
     /// 端から 56px 以内に入ったら、その方向の行き先をボーダーで示す(起点・手元のとき)
     private func updateGlowAtHome(_ loc: CGPoint) {
+        if soloMode { EdgeGlow.shared.hide(); return }
         let b = allBounds
         let spots: [(PartnerDir, Double, Double)] = [
             (.right, Double(b.maxX) - Double(loc.x), (Double(loc.y) - Double(b.minY)) / Double(b.height)),
@@ -1106,6 +1128,7 @@ final class CursorShare {
     /// 押し込み量が設定されているときは、端に張り付いたまま外向きに押し込んだ
     /// 合計がその量に達するまで渡さない(端でのバタつき防止にもなる)
     private func checkEdges(_ event: CGEvent) -> Bool {
+        if soloMode { return false }
         let b = allBounds
         let loc = event.location
         let dx = Double(event.getIntegerValueField(.mouseEventDeltaX))
@@ -1214,6 +1237,12 @@ final class CursorShare {
                 LinkNet.sendReset()
                 status("カーソル共有： 一周して戻りました")
                 sendAtSelf()
+                return
+            }
+            if soloMode {
+                // 単独モード: 受け取らず、そのまま送り返す(送り手は「手元に戻ってきた」として処理する)
+                LinkNet.sendFast("leave \(from) \(seg)")
+                status("単独モード： \(peerName(from)) からのカーソルを返送しました")
                 return
             }
             // 自分が起点でも、カーソルが手元に戻っている状態なら受け取れる(セッションは相手に譲る)。
@@ -3024,6 +3053,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var snapItem: NSMenuItem!
     var switchItem: NSMenuItem!
     var searchItem: NSMenuItem!
+    var soloItem: NSMenuItem!
     var logItem: NSMenuItem!
     private var logWC: LogWindowController?
     var loginItem: NSMenuItem!
@@ -3050,6 +3080,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switchItem.target = self
         searchItem = NSMenuItem(title: "検索の連動", action: #selector(toggleSearch), keyEquivalent: "")
         searchItem.target = self
+        soloItem = NSMenuItem(title: "単独モード", action: #selector(toggleSolo), keyEquivalent: "")
+        soloItem.target = self
         logItem = NSMenuItem(title: "ログを表示", action: #selector(showLog), keyEquivalent: "")
         logItem.target = self
         snapItem.target = self
@@ -3096,7 +3128,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         permItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self
-        menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(snapItem); menu.addItem(switchItem); menu.addItem(searchItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(logItem); menu.addItem(.separator())
+        menu.addItem(buildItem); menu.addItem(cursorAtItem); menu.addItem(.separator()); menu.addItem(enabledItem); menu.addItem(remoteItem); menu.addItem(linkItem); menu.addItem(cursorItem); menu.addItem(snapItem); menu.addItem(switchItem); menu.addItem(searchItem); menu.addItem(soloItem); menu.addItem(tapItem); menu.addItem(layoutItem); menu.addItem(moveParent); menu.addItem(lastItem); menu.addItem(mtItem); menu.addItem(statsItem); menu.addItem(diagItem); menu.addItem(logItem); menu.addItem(.separator())
         menu.addItem(permItem); menu.addItem(inputItem); menu.addItem(.separator())
         cursorShowItem = NSMenuItem(title: "カーソルを大きく表示", action: #selector(toggleCursorShow), keyEquivalent: "")
         cursorShowItem.target = self
@@ -3259,6 +3291,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         snapItem.state = DialogSnap.shared.enabled ? .on : .off
         switchItem.state = SwitchSync.shared.enabled ? .on : .off
         searchItem.state = SearchSync.shared.enabled ? .on : .off
+        soloItem.state = CursorShare.shared.soloMode ? .on : .off
         tapItem.state = Engine.shared.keyTapSession ? .on : .off
         diagItem.state = UserDefaults.standard.bool(forKey: "showDiag") ? .on : .off
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -3342,6 +3375,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func toggleSearch() {
         SearchSync.shared.enabled.toggle()
+        refreshMenu()
+    }
+
+    @objc func toggleSolo() {
+        CursorShare.shared.soloMode.toggle()
+        if CursorShare.shared.soloMode { CursorShare.shared.enforceSolo() }
         refreshMenu()
     }
 

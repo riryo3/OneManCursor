@@ -35,7 +35,7 @@ else
     echo "署名: 場当たり（Apple Development 証明書が見つかりませんでした）"
     codesign --force --deep --sign - "$APP"
 fi
-echo "できた: $APP（$BUILD_TAG）"
+echo "できた: $APP / $BUILD_TAG"
 
 # 配布用: sh build.sh dist
 # 自分用の署名(証明書名に Apple ID のメアドが入る)をはがして場当たり署名に付け替え、
@@ -50,5 +50,5 @@ if [ "$1" = "dist" ]; then
         exit 1
     fi
     (cd dist && ditto -c -k --keepParent "$APP" "OneManCursor.zip")
-    echo "配布用できた: dist/OneManCursor.zip（$BUILD_TAG、署名は場当たり署名に付け替え済み）"
+    echo "配布用できた（署名は場当たり署名に付け替え済み）: dist/OneManCursor.zip / $BUILD_TAG"
 fi

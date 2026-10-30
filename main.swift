@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-44"
+let buildTag = "Build 20261030-43"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2159,9 +2159,7 @@ final class IdentifyGlowView: NSView {
 
 /// レイアウト編集のタイルに、各マシンの画面の縮小画像を出すための送受信。
 /// 編集画面を開いている端末が threq を送り、受けた側が自分の画面を撮って
-/// JPEG を細切れ(thimg)にして返す。遅延は気にしない(数秒単位でよい)前提。
-/// 個人情報の保護のため、撮る幅を小さくしてあり、タイルで引き伸ばされることで
-/// 文字は読めない程度にぼける(ぼかした画像だけがネットワークを流れる)
+/// JPEG を細切れ(thimg)にして返す。遅延は気にしない(数秒単位でよい)前提
 final class ThumbShare {
     static let shared = ThumbShare()
     private(set) var images: [String: (img: NSImage, at: Date)] = [:]
@@ -2203,7 +2201,7 @@ final class ThumbShare {
         }
     }
 
-    /// 自分の画面を幅160pxの JPEG にする(画面収録の許可が無いと失敗する)
+    /// 自分の画面を幅320pxの JPEG にする(画面収録の許可が無いと失敗する)
     private func captureScreen(completion: @escaping (Data?) -> Void) {
         guard #available(macOS 14.0, *) else { completion(nil); return }
         Task {
@@ -2212,8 +2210,8 @@ final class ThumbShare {
                 guard let display = content.displays.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) else { completion(nil); return }
                 let filter = SCContentFilter(display: display, excludingWindows: [])
                 let cfg = SCStreamConfiguration()
-                cfg.width = 160
-                cfg.height = max(1, 160 * display.height / max(1, display.width))
+                cfg.width = 320
+                cfg.height = max(1, 320 * display.height / max(1, display.width))
                 cfg.showsCursor = false
                 let cg = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
                 let rep = NSBitmapImageRep(cgImage: cg)

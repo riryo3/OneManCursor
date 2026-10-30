@@ -41,7 +41,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261031-55";
+    private const string BuildTag = "Build 20261031-56";
 
     private static string SpecId(string spec)
     {
@@ -427,6 +427,7 @@ internal static class Program
 
     private static bool Cross(string dir, double ratio)
     {
+        HideGlow();
         PeerLinkC l = FindLink(dir, ratio);
         if (l == null) return false;
         double s, e;
@@ -484,6 +485,7 @@ internal static class Program
             if (vy < ScrY) vy = ScrY;
             if (vy > ScrY + ScrH - 1) vy = ScrY + ScrH - 1;
             Warp();
+            UpdateGlow();
         }
         else if (kind == "dn" || kind == "up")
         {
@@ -736,6 +738,118 @@ internal static class Program
         }, null);
     }
 
+    // ---- 端ボーダー表示 (Mac 版 EdgeGlow と同じ見た目) ----
+    // 保持中にカーソルがリンクのある端56px以内に入ると、行き先マシンの色で画面の輪郭が
+    // 光る (全体はうっすら30%、行き先の区間ははっきり95%)。クリックは素通りする
+    private sealed class GlowForm : Form
+    {
+        protected override bool ShowWithoutActivation { get { return true; } }
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x20 | 0x8000000 | 0x80; // WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+                return cp;
+            }
+        }
+    }
+
+    private static GlowForm glowT, glowB, glowL, glowR, glowSeg;
+    private static string glowKey = "";
+
+    private static GlowForm MakeGlowStrip()
+    {
+        GlowForm f = new GlowForm();
+        f.FormBorderStyle = FormBorderStyle.None;
+        f.ShowInTaskbar = false;
+        f.TopMost = true;
+        f.StartPosition = FormStartPosition.Manual;
+        return f;
+    }
+
+    private static void HideGlow() { SetGlow("", Color.Black, null, 0, 0); }
+
+    private static void SetGlow(string key, Color color, string dir, double s, double e)
+    {
+        if (uiCtx == null) return;
+        if (key == glowKey) return;
+        glowKey = key;
+        uiCtx.Post(delegate
+        {
+            try
+            {
+                if (glowT == null)
+                {
+                    glowT = MakeGlowStrip(); glowB = MakeGlowStrip();
+                    glowL = MakeGlowStrip(); glowR = MakeGlowStrip();
+                    glowSeg = MakeGlowStrip();
+                }
+                if (key.Length == 0)
+                {
+                    glowT.Hide(); glowB.Hide(); glowL.Hide(); glowR.Hide(); glowSeg.Hide();
+                    return;
+                }
+                int bx = ScrX, by = ScrY, bw = ScrW, bh = ScrH;
+                foreach (GlowForm f in new GlowForm[] { glowT, glowB, glowL, glowR })
+                { f.BackColor = color; f.Opacity = 0.30; }
+                glowT.Bounds = new Rectangle(bx, by, bw, 5);
+                glowB.Bounds = new Rectangle(bx, by + bh - 5, bw, 5);
+                glowL.Bounds = new Rectangle(bx, by, 5, bh);
+                glowR.Bounds = new Rectangle(bx + bw - 5, by, 5, bh);
+                glowSeg.BackColor = color; glowSeg.Opacity = 0.95;
+                if (dir == "left") glowSeg.Bounds = new Rectangle(bx, by + (int)(s * bh), 7, Math.Max(2, (int)((e - s) * bh)));
+                else if (dir == "right") glowSeg.Bounds = new Rectangle(bx + bw - 7, by + (int)(s * bh), 7, Math.Max(2, (int)((e - s) * bh)));
+                else if (dir == "up") glowSeg.Bounds = new Rectangle(bx + (int)(s * bw), by, Math.Max(2, (int)((e - s) * bw)), 7);
+                else glowSeg.Bounds = new Rectangle(bx + (int)(s * bw), by + bh - 7, Math.Max(2, (int)((e - s) * bw)), 7);
+                glowT.Show(); glowB.Show(); glowL.Show(); glowR.Show(); glowSeg.Show();
+                glowSeg.BringToFront();
+            }
+            catch (Exception) { }
+        }, null);
+    }
+
+    private static Color PeerColor(string id)
+    {
+        string hex;
+        if (colorMap.TryGetValue(id, out hex))
+        {
+            try { return ColorTranslator.FromHtml(hex); } catch (Exception) { }
+        }
+        // Mac 版と同じ既定色: ID の djb2 ハッシュ → 色相、彩度 0.65・明度 0.95
+        ulong h = 5381;
+        foreach (char ch in id) h = h * 33 + ch;
+        double hue = (h % 360) / 360.0;
+        double cc = 0.95 * 0.65;
+        double xx = cc * (1 - Math.Abs((hue * 6) % 2 - 1));
+        double mm = 0.95 - cc;
+        double r, g, b;
+        if (hue < 1.0 / 6) { r = cc; g = xx; b = 0; }
+        else if (hue < 2.0 / 6) { r = xx; g = cc; b = 0; }
+        else if (hue < 3.0 / 6) { r = 0; g = cc; b = xx; }
+        else if (hue < 4.0 / 6) { r = 0; g = xx; b = cc; }
+        else if (hue < 5.0 / 6) { r = xx; g = 0; b = cc; }
+        else { r = cc; g = 0; b = xx; }
+        return Color.FromArgb((int)((r + mm) * 255), (int)((g + mm) * 255), (int)((b + mm) * 255));
+    }
+
+    private static void UpdateGlow()
+    {
+        if (!holding || forwardTo != null) { HideGlow(); return; }
+        double x = vx - ScrX, y = vy - ScrY;
+        string dir = null; double ratio = 0;
+        if (x <= 56) { dir = "left"; ratio = y / Math.Max(1, ScrH); }
+        else if (x >= ScrW - 56) { dir = "right"; ratio = y / Math.Max(1, ScrH); }
+        else if (y <= 56) { dir = "up"; ratio = x / Math.Max(1, ScrW); }
+        else if (y >= ScrH - 56) { dir = "down"; ratio = x / Math.Max(1, ScrW); }
+        if (dir == null) { HideGlow(); return; }
+        PeerLinkC l = FindLink(dir, ratio);
+        if (l == null) { HideGlow(); return; }
+        double s, e;
+        SpecSpan(l.Spec, out s, out e);
+        SetGlow(dir + "|" + l.Id + "|" + s + "|" + e, PeerColor(l.Id), dir, s, e);
+    }
+
     private static DateTime lastThumbAt = DateTime.MinValue;
     // レイアウト編集を開いている Mac から threq が来たら、自分の画面の縮小 JPEG を断片で返す
     private static void SendThumb(string to)
@@ -880,6 +994,7 @@ internal static class Program
             if (d != null) PositionAtEdge(d, ratio, from);
             Log("カーソル共有: " + PeerName(from) + " から受け取りました");
             SendAtSelf();
+            UpdateGlow();
         }
         else if (kind == "leave")
         {
@@ -1153,6 +1268,7 @@ internal static class Program
             if (kind == "reset")
             {
                 holding = false; cameFrom = null; forwardTo = null;
+                HideGlow();
                 Log("カーソル共有: リセットされました");
                 continue;
             }

@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-26"
+let buildTag = "Build 20261030-27"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2489,13 +2489,25 @@ final class SwitchSync {
     }
 
     private func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags) {
-        let src = CGEventSource(stateID: .hidSystemState)
-        for down in [true, false] {
-            if let e = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: down) {
-                e.flags = flags
-                CursorShare.markSynthetic(e)
-                e.post(tap: .cghidEventTap)
-            }
+        // 修飾キーは flagsChanged として独立に送らないと Dock のショートカット判定に届かない
+        // (セッションのキー転送と同じ方式。flags 欄だけの合成では MC が開かないことを実機で確認)
+        var mods: [(CGKeyCode, CGEventFlags)] = []
+        if flags.contains(.maskControl) { mods.append((59, .maskControl)) }
+        if flags.contains(.maskCommand) { mods.append((55, .maskCommand)) }
+        if flags.contains(.maskAlternate) { mods.append((58, .maskAlternate)) }
+        if flags.contains(.maskShift) { mods.append((56, .maskShift)) }
+        for (mc, fl) in mods { postOne(mc, down: true, flags: fl, flagsChanged: true) }
+        postOne(keyCode, down: true, flags: flags, flagsChanged: false)
+        postOne(keyCode, down: false, flags: flags, flagsChanged: false)
+        for (mc, _) in mods.reversed() { postOne(mc, down: false, flags: [], flagsChanged: true) }
+    }
+
+    private func postOne(_ code: CGKeyCode, down: Bool, flags: CGEventFlags, flagsChanged: Bool) {
+        if let e = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) {
+            e.flags = flags
+            if flagsChanged { e.type = .flagsChanged }
+            CursorShare.markSynthetic(e)
+            e.post(tap: .cghidEventTap)
         }
     }
 }

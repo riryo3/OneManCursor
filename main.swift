@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-37"
+let buildTag = "Build 20261030-38"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -106,6 +106,7 @@ final class Engine {
     private var startX: Float = 0, startY: Float = 0
     private var startT: Double = 0
     private var fired = false
+    private var lastDx: Float = 0, lastDy: Float = 0   // 診断用: 最後に見た移動量
 
     // しきい値(正規化座標 0...1 に対する割合)
     private let flickMin: Float = 0.20     // 2本指フリックの最小移動量
@@ -115,7 +116,12 @@ final class Engine {
 
     func handle(_ fingers: [Finger], timestamp: Double) {
         let downs = fingers.filter { $0.state == 3 || $0.state == 4 }
-        if downs.isEmpty { session = false; fired = false; lockedCount = 0; return }
+        if downs.isEmpty {
+            if session && !fired && lockedCount >= 3 {
+                NetLog.shared.log("ジェスチャ不成立: 指\(lockedCount)本 dy=\(lastDy) dx=\(lastDx)")
+            }
+            session = false; fired = false; lockedCount = 0; return
+        }
         let n = downs.count
         let cx = downs.reduce(Float(0)) { $0 + $1.normalized.position.x } / Float(n)
         let cy = downs.reduce(Float(0)) { $0 + $1.normalized.position.y } / Float(n)
@@ -129,6 +135,7 @@ final class Engine {
         if n > lockedCount { lockedCount = n; lockStableSince = timestamp }
         guard !fired, n >= 2 else { return }
         let dx = cx - startX, dy = cy - startY
+        lastDx = dx; lastDy = dy
         let elapsed = timestamp - startT
 
         if lockedCount == 2 {
@@ -142,9 +149,21 @@ final class Engine {
             // 4本目が遅れて触れることがあるため、本数が安定するまでは発火しない。
             // 安定を待たないと、4本指スワイプを3本指と誤認して横取りしてしまう
             if timestamp - lockStableSince >= graceTime, abs(dy) >= vertMin, abs(dy) >= 2 * abs(dx) {
-                fire(dy > 0 ? .open : .parent)
+                let front = NSWorkspace.shared.frontmostApplication
+                let finderContext = front?.bundleIdentifier == "com.apple.finder"
+                    || (remoteMode && front?.localizedName == "Moonlight")
+                    || CursorShare.shared.sessionActiveAway
+                if enabled && !finderContext {
+                    // Finder 操作として効かない場面の3本指縦スワイプは切り替え連動に回す
+                    // (4本指のつもりで1本が軽く触れていた場合の受け皿。今は無反応な入力)
+                    fired = true
+                    let up = dy > 0
+                    DispatchQueue.main.async { SwitchSync.shared.noteGesture(up: up) }
+                } else {
+                    fire(dy > 0 ? .open : .parent)
+                }
             }
-        } else if lockedCount == 4 {
+        } else if lockedCount >= 4 {
             // 4本指の縦スワイプは Mission Control / Exposé のジェスチャ(切り替え連動の検知)
             if abs(dy) >= vertMin, abs(dy) >= 2 * abs(dx) {
                 fired = true
@@ -2394,7 +2413,7 @@ final class SwitchSync {
     /// 切り替え中の下スワイプは「閉じた=確定」として扱う
     func noteGesture(up: Bool) {
         guard enabled else { return }
-        NetLog.shared.log("MC検知: 4本指スワイプ (up=\(up))")
+        NetLog.shared.log("MC検知: 縦スワイプ (up=\(up))")
         if switching {
             if !up { decide(reason: "下スワイプ") }
         } else {

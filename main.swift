@@ -2375,6 +2375,7 @@ final class SwitchSync {
     private var mcClosedStreak = 0
     private var mcSeenVisible = false
     private var flagSetAt = Date.distantPast
+    private var mcVisibleSince: Date?   // 一覧の画面が見え始めた時刻
     var onNote: ((String) -> Void)?
 
     func start() {
@@ -2481,6 +2482,7 @@ final class SwitchSync {
             flagSetAt = Date()
             mcClosedStreak = 0
             mcSeenVisible = false
+            mcVisibleSince = nil
             startMcPoll()
             let t = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
                 self?.setFlag(false)
@@ -2511,6 +2513,7 @@ final class SwitchSync {
     private func mcPollTick() {
         guard switching else { stopMcPoll(); return }
         if mcVisible() {
+            if mcVisibleSince == nil { mcVisibleSince = Date() }
             mcSeenVisible = true
             mcClosedStreak = 0
             return
@@ -2518,9 +2521,11 @@ final class SwitchSync {
         // 一覧の画面が一度も見えていない間は判定しない(開くアニメーションの途中や、
         // 合図で開けなかった場合に「閉じた」と誤認しないため)
         guard mcSeenVisible else { return }
-        if Date().timeIntervalSince(flagSetAt) < 1.2 { return }
+        // 見え始めてから間もないうちも判定しない。開くアニメーションの間に
+        // 画面(Dock のウィンドウ)が入れ替わって、一時的に見えなくなるため
+        guard let since = mcVisibleSince, Date().timeIntervalSince(since) >= 2.0 else { return }
         mcClosedStreak += 1
-        if mcClosedStreak >= 2 {
+        if mcClosedStreak >= 3 {
             NetLog.shared.log("MC終了を検知: 画面")
             decide(reason: "MC終了(画面)")
         }

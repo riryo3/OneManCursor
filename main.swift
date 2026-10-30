@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-39"
+let buildTag = "Build 20261030-40"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 

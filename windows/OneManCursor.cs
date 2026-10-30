@@ -41,7 +41,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-48";
+    private const string BuildTag = "Build 20261030-49";
 
     private static string SpecId(string spec)
     {
@@ -536,6 +536,12 @@ internal static class Program
         }
     }
 
+    /// 注入したまま離し忘れた修飾キーが残らないよう、全部まとめて離す(押しっぱなし事故の掃除)
+    private static void ReleaseModifiers()
+    {
+        SendInputs(MakeKey(0x10, true), MakeKey(0x11, true), MakeKey(0x12, true), MakeKey(0x5B, true), MakeKey(0x5C, true));
+    }
+
     private static void HandleAssign(string[] args)
     {
         links.Clear();
@@ -788,7 +794,7 @@ internal static class Program
         }
         if (kind == "sqry" && args.Length >= 3 && searching)
         {
-            if (!IsForegroundSearch()) { searching = false; return; }
+            if (!IsForegroundSearch()) { searching = false; ReleaseModifiers(); return; }
             string text = "";
             if (args[2] != "~")
             {
@@ -816,14 +822,31 @@ internal static class Program
         }
         if (kind == "sdone")
         {
-            if (searching) { searching = false; PressKey(0x1B); }
+            if (searching) { searching = false; ReleaseModifiers(); PressKey(0x1B); }
             return;
         }
         if ((kind == "kd" || kind == "ku" || kind == "fl") && searching)
         {
             // 検索の連動: 起点の打鍵をそのまま再現する。検索が最前面でなければ事故防止に終了
-            if (!IsForegroundSearch()) { searching = false; return; }
+            if (!IsForegroundSearch()) { searching = false; ReleaseModifiers(); return; }
             ApplyCursor(kind, args);
+            return;
+        }
+        if (kind == "fl" && !holding && forwardTo == null && args.Length >= 2)
+        {
+            // 連動中でなくても、修飾キーの「離す」だけは必ず通す。
+            // 終了合図と前後して届いた「離す」を落とすと、キーが押されたままになる事故になる
+            int fcode; long fflags;
+            if (int.TryParse(args[0], out fcode) && long.TryParse(args[1], out fflags))
+            {
+                long bit = fcode == 56 || fcode == 60 ? 0x20000L
+                         : fcode == 59 || fcode == 62 ? 0x40000L
+                         : fcode == 58 || fcode == 61 ? 0x80000L
+                         : fcode == 55 || fcode == 54 ? 0x100000L : 0L;
+                ushort vk;
+                if (bit != 0 && (fflags & bit) == 0 && MacKeyToVK.TryGetValue(fcode, out vk))
+                    SendInputs(MakeKey(vk, true));
+            }
             return;
         }
         if (kind == "identify") { ShowIdentify(); return; }

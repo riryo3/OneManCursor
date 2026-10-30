@@ -8,13 +8,15 @@ APP="OneManCursor.app"
 # ソースのビルド番号を表示する(どの版を作っているか一目で分かるように)
 BUILD_TAG=$(grep -o '"Build [0-9-]*"' main.swift | head -1 | tr -d '"')
 echo "ビルド番号: $BUILD_TAG"
+# アイコンに焼き込むための末尾の番号(例: 32)
+BUILD_NUM=$(printf '%s' "$BUILD_TAG" | awk -F- '{print $NF}')
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 # アイコン生成（make_icon.swift → iconset → icns）
 swiftc make_icon.swift -o /tmp/onemancursor_make_icon
 ICONSET="$(mktemp -d)/AppIcon.iconset"
-/tmp/onemancursor_make_icon "$ICONSET"
+/tmp/onemancursor_make_icon "$ICONSET" "$BUILD_NUM"
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
 # 本体（Apple Silicon / Intel 両対応のユニバーサルバイナリ）

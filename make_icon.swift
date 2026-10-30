@@ -28,9 +28,24 @@ func render(_ px: Int) -> Data {
                                                 .strokeColor: NSColor.white, .strokeWidth: -8.0]
     let ts = s.size(withAttributes: attrs)
     s.draw(at: NSPoint(x: box.midX - ts.width / 2, y: box.midY - ts.height / 2), withAttributes: attrs)
+    // ビルド番号を右下に焼き込む(指定があるときだけ)
+    if !badge.isEmpty {
+        let bfont = NSFont.systemFont(ofSize: 190 * u, weight: .heavy)
+        let battrs: [NSAttributedString.Key: Any] = [.font: bfont, .foregroundColor: NSColor.white]
+        let bs = badge as NSString
+        let bts = bs.size(withAttributes: battrs)
+        let pill = NSRect(x: box.maxX - bts.width - 110 * u, y: box.minY + 34 * u,
+                          width: bts.width + 56 * u, height: bts.height + 30 * u)
+        NSColor(calibratedWhite: 0, alpha: 0.30).setFill()
+        NSBezierPath(roundedRect: pill, xRadius: pill.height / 2, yRadius: pill.height / 2).fill()
+        bs.draw(at: NSPoint(x: pill.midX - bts.width / 2, y: pill.midY - bts.height / 2), withAttributes: battrs)
+    }
     NSGraphicsContext.restoreGraphicsState()
     return rep.representation(using: .png, properties: [:])!
 }
+
+// ビルド番号(任意): アイコンの右下に小さく焼き込む。古いコピーを一目で見分けるため
+let badge = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : ""
 
 let dir = CommandLine.arguments[1]
 try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)

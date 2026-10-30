@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-32"
+let buildTag = "Build 20261030-33"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -2442,29 +2442,58 @@ final class SwitchSync {
         }
     }
 
+    /// 本物のキーイベントが持っている flags を再現する。
+    /// 実測(キー適用ログ): 本物の Ctrl+↑ は kd の flags が 0xA40101 で、素の maskControl(0x40000)
+    /// とは大きく違う。矢印キーには Fn(0x800000)と NumericPad(0x200000)が付き、全イベントに
+    /// NonCoalesced(0x100)、修飾キーには左右デバイスビット(Ctrl=0x1, Shift=0x2, Cmd=0x8, Opt=0x20)が付く。
+    /// Dock のショートカット判定は、この完全な形でないと受け付けないらしい
+    private func realisticFlags(for keyCode: CGKeyCode, mods: CGEventFlags) -> CGEventFlags {
+        var f = mods
+        f.insert(.maskNonCoalesced)
+        if mods.contains(.maskControl) { f.insert(CGEventFlags(rawValue: 0x1)) }
+        if mods.contains(.maskShift) { f.insert(CGEventFlags(rawValue: 0x2)) }
+        if mods.contains(.maskCommand) { f.insert(CGEventFlags(rawValue: 0x8)) }
+        if mods.contains(.maskAlternate) { f.insert(CGEventFlags(rawValue: 0x20)) }
+        if keyCode == 123 || keyCode == 124 || keyCode == 125 || keyCode == 126 {
+            f.formUnion([.maskSecondaryFn, .maskNumericPad])
+        }
+        if keyCode == 99 { f.insert(.maskSecondaryFn) }  // F3
+        return f
+    }
+
     private func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags) {
         // 修飾キーは flagsChanged として独立に送り、さらに本体キーとは間隔を空けて送る。
         // 一息に全部送ると Dock のショートカット判定が修飾キーの変化を取りこぼす疑いがあるため、
-        // 人間の押下(修飾キーを押してから本体キー)に近づける
+        // 人間の押下(修飾キーを押してから本体キー)に近づける。
+        // flags は本物そっくりにする(realisticFlags)。素の mask だけでは Dock が判定しない
         var mods: [(CGKeyCode, CGEventFlags)] = []
         if flags.contains(.maskControl) { mods.append((59, .maskControl)) }
         if flags.contains(.maskCommand) { mods.append((55, .maskCommand)) }
         if flags.contains(.maskAlternate) { mods.append((58, .maskAlternate)) }
         if flags.contains(.maskShift) { mods.append((56, .maskShift)) }
-        NetLog.shared.log("キー合成: code=\(keyCode) flags=\(flags.rawValue)")
-        for (mc, fl) in mods { postOne(mc, down: true, flags: fl, flagsChanged: true) }
+        let keyFlags = realisticFlags(for: keyCode, mods: flags)
+        NetLog.shared.log("キー合成: code=\(keyCode) flags=\(flags.rawValue) 実flags=\(keyFlags.rawValue)")
+        var held: CGEventFlags = []
+        for (mc, fl) in mods {
+            held.insert(fl)
+            postOne(mc, down: true, flags: realisticFlags(for: mc, mods: held), flagsChanged: true)
+        }
         let step = 0.06
         let keyDelay = mods.isEmpty ? 0.0 : step
         DispatchQueue.main.asyncAfter(deadline: .now() + keyDelay) { [weak self] in
-            self?.postOne(keyCode, down: true, flags: flags, flagsChanged: false)
+            self?.postOne(keyCode, down: true, flags: keyFlags, flagsChanged: false)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + keyDelay + step) { [weak self] in
-            self?.postOne(keyCode, down: false, flags: flags, flagsChanged: false)
+            self?.postOne(keyCode, down: false, flags: keyFlags, flagsChanged: false)
         }
         if !mods.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + keyDelay + step * 2) { [weak self] in
                 guard let self else { return }
-                for (mc, _) in mods.reversed() { self.postOne(mc, down: false, flags: [], flagsChanged: true) }
+                var rest = flags
+                for (mc, fl) in mods.reversed() {
+                    rest.remove(fl)
+                    self.postOne(mc, down: false, flags: self.realisticFlags(for: mc, mods: rest), flagsChanged: true)
+                }
             }
         }
     }

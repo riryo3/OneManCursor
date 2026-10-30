@@ -3,6 +3,7 @@ import ApplicationServices
 import IOKit
 import ServiceManagement
 import UniformTypeIdentifiers
+import ScreenCaptureKit
 
 // OneManCursor: Finder でスワイプ操作するための常駐アプリ(試作)
 // - 2本指の横フリック → 戻る(⌘[) / 進む(⌘])
@@ -10,7 +11,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-42"
+let buildTag = "Build 20261030-43"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1274,6 +1275,12 @@ final class CursorShare {
             SearchSync.shared.receiveDone()
         case "identify":
             IdentifyGlow.shared.showSelf()
+        case "threq":
+            ThumbShare.shared.handleRequest(from: from)
+        case "thimg":
+            if rest.count >= 4, let idx = Int(rest[1]), let total = Int(rest[2]) {
+                ThumbShare.shared.handleChunk(from: from, tid: rest[0], idx: idx, total: total, chunk: rest[3])
+            }
         case "mv", "dn", "up", "sc", "kd", "ku", "fl":
             if holding {
                 apply(kind, args: rest)
@@ -2042,6 +2049,15 @@ final class LayoutCanvasView: NSView {
         let online = isSelf || (LinkNet.peers[id].map { Date().timeIntervalSince($0.seen) < 120 } ?? false)
         (online ? NSColor.textBackgroundColor : NSColor.textBackgroundColor.withAlphaComponent(0.4)).setFill()
         path.fill()
+        // 画面のサムネイルが届いていれば、タイル内に表示する(30秒以内のものだけ)
+        var freshThumb: NSImage? = nil
+        if let th = ThumbShare.shared.images[id], Date().timeIntervalSince(th.at) < 30 {
+            freshThumb = th.img
+            NSGraphicsContext.saveGraphicsState()
+            path.addClip()
+            th.img.draw(in: viewRect, from: NSRect(origin: .zero, size: th.img.size), operation: .copy, fraction: 1)
+            NSGraphicsContext.restoreGraphicsState()
+        }
         let mcol = colorFromHex(machineColorHex(of: id))
         mcol.setStroke()
         path.lineWidth = (isSelf ? 3 : 2.5) + (dragging ? 1.5 : 0)
@@ -2063,6 +2079,12 @@ final class LayoutCanvasView: NSView {
         let nameAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor, .paragraphStyle: style]
         let subAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 10), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: style]
         let midY = Double(viewRect.midY)
+        if freshThumb != nil {
+            // サムネイルの上では文字が読みにくいので、帯を敷く
+            let band = NSRect(x: viewRect.minX + 4, y: CGFloat(midY - 21), width: viewRect.width - 8, height: 37)
+            NSColor.textBackgroundColor.withAlphaComponent(0.78).setFill()
+            NSBezierPath(roundedRect: band, xRadius: 5, yRadius: 5).fill()
+        }
         let nameRect = NSRect(x: viewRect.minX + 4, y: CGFloat(midY - 2), width: viewRect.width - 8, height: 16)
         (name as NSString).draw(in: nameRect, withAttributes: nameAttrs)
         let subRect = NSRect(x: viewRect.minX + 4, y: CGFloat(midY - 18), width: viewRect.width - 8, height: 13)
@@ -2132,7 +2154,94 @@ final class IdentifyGlowView: NSView {
 }
 
 /// レイアウト編集ウィンドウ
-final class LayoutWindowController: NSWindowController {
+
+// MARK: - 画面のサムネイル
+
+/// レイアウト編集のタイルに、各マシンの画面の縮小画像を出すための送受信。
+/// 編集画面を開いている端末が threq を送り、受けた側が自分の画面を撮って
+/// JPEG を細切れ(thimg)にして返す。遅延は気にしない(数秒単位でよい)前提
+final class ThumbShare {
+    static let shared = ThumbShare()
+    private(set) var images: [String: (img: NSImage, at: Date)] = [:]
+    private var assembly: [String: (tid: String, parts: [Int: String], total: Int)] = [:]
+    private var lastCaptureAt = Date.distantPast
+    private var capturing = false
+
+    /// threq を受けた: 自分の画面を撮って、頼んだ相手へ送る
+    func handleRequest(from: String) {
+        captureThrottled { data in
+            guard let data = data else { return }
+            let b64 = data.base64EncodedString()
+            let tid = String(format: "%08x", UInt32.random(in: 0...UInt32.max))
+            let total = (b64.count + 799) / 800
+            for idx in 0..<total {
+                let s = b64.index(b64.startIndex, offsetBy: idx * 800)
+                let e = b64.index(s, offsetBy: min(800, b64.count - idx * 800))
+                LinkNet.sendFast("thimg \(from) \(tid) \(idx) \(total) \(b64[s..<e])")
+            }
+        }
+    }
+
+    /// 自分のサムネイル(自分のタイル用)。送らずに手元へしまう
+    func captureOwn() {
+        captureThrottled { data in
+            guard let data = data, let img = NSImage(data: data) else { return }
+            DispatchQueue.main.async { ThumbShare.shared.images[LinkNet.machineID] = (img, Date()) }
+        }
+    }
+
+    private func captureThrottled(_ completion: @escaping (Data?) -> Void) {
+        let now = Date()
+        guard now.timeIntervalSince(lastCaptureAt) > 2, !capturing else { completion(nil); return }
+        lastCaptureAt = now
+        capturing = true
+        captureScreen { [weak self] data in
+            self?.capturing = false
+            completion(data)
+        }
+    }
+
+    /// 自分の画面を幅320pxの JPEG にする(画面収録の許可が無いと失敗する)
+    private func captureScreen(completion: @escaping (Data?) -> Void) {
+        guard #available(macOS 14.0, *) else { completion(nil); return }
+        Task {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                guard let display = content.displays.max(by: { ($0.width * $0.height) < ($1.width * $1.height) }) else { completion(nil); return }
+                let filter = SCContentFilter(display: display, excludingWindows: [])
+                let cfg = SCStreamConfiguration()
+                cfg.width = 320
+                cfg.height = max(1, 320 * display.height / max(1, display.width))
+                cfg.showsCursor = false
+                let cg = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+                let rep = NSBitmapImageRep(cgImage: cg)
+                completion(rep.representation(using: .jpeg, properties: [.compressionFactor: 0.55]))
+            } catch {
+                NetLog.shared.log("サムネ撮影に失敗: \(error.localizedDescription)")
+                completion(nil)
+            }
+        }
+    }
+
+    /// thimg を受けた: 断片を集めて1枚にする(組み立てはメインスレッドで)
+    func handleChunk(from: String, tid: String, idx: Int, total: Int, chunk: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            var a = self.assembly[from] ?? (tid: tid, parts: [Int: String](), total: total)
+            if a.tid != tid { a = (tid: tid, parts: [:], total: total) }
+            a.parts[idx] = chunk
+            a.total = total
+            self.assembly[from] = a
+            guard a.parts.count >= total else { return }
+            let b64 = (0..<total).map { a.parts[$0] ?? "" }.joined()
+            self.assembly[from] = nil
+            guard let data = Data(base64Encoded: b64), let img = NSImage(data: data) else { return }
+            self.images[from] = (img, Date())
+        }
+    }
+}
+
+final class LayoutWindowController: NSWindowController, NSWindowDelegate {
     private var canvas: LayoutCanvasView!
 
     convenience init() {
@@ -2165,7 +2274,38 @@ final class LayoutWindowController: NSWindowController {
         window.title = mothershipTitle()
         window.contentView = root
         window.minSize = NSSize(width: 480, height: 400)
+        window.delegate = self
         self.window = window
+    }
+
+    private var thumbTimer: Timer?
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        startThumbPolling()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        thumbTimer?.invalidate()
+        thumbTimer = nil
+    }
+
+    /// 編集画面を開いている間だけ、各マシンの画面サムネイルを集める
+    private func startThumbPolling() {
+        if !CGPreflightScreenCaptureAccess() { CGRequestScreenCaptureAccess() }
+        requestThumbs()
+        thumbTimer?.invalidate()
+        let t = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in self?.requestThumbs() }
+        RunLoop.main.add(t, forMode: .common)
+        thumbTimer = t
+    }
+
+    private func requestThumbs() {
+        for pid in LinkNet.peers.keys where pid != LinkNet.machineID {
+            LinkNet.sendFast("threq \(pid)")
+        }
+        ThumbShare.shared.captureOwn()
+        canvas.needsDisplay = true
     }
 
     @objc func toggleSnap(_ b: NSButton) {

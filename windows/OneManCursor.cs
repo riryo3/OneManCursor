@@ -16,6 +16,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -40,7 +41,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-42";
+    private const string BuildTag = "Build 20261030-43";
 
     private static string SpecId(string spec)
     {
@@ -725,6 +726,45 @@ internal static class Program
         }, null);
     }
 
+    private static DateTime lastThumbAt = DateTime.MinValue;
+    // レイアウト編集を開いている Mac から threq が来たら、自分の画面の縮小 JPEG を断片で返す
+    private static void SendThumb(string to)
+    {
+        DateTime now = DateTime.Now;
+        if ((now - lastThumbAt).TotalSeconds < 2) return;
+        lastThumbAt = now;
+        try
+        {
+            Rectangle b = Screen.PrimaryScreen.Bounds;
+            using (Bitmap bmp = new Bitmap(b.Width, b.Height))
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.CopyFromScreen(b.Location, Point.Empty, b.Size);
+                int tw = 320;
+                int th = Math.Max(1, (int)(320.0 * b.Height / Math.Max(1, b.Width)));
+                using (Bitmap small = new Bitmap(bmp, new Size(tw, th)))
+                using (MemoryStream ms = new MemoryStream())
+                {
+                    ImageCodecInfo codec = null;
+                    foreach (ImageCodecInfo c in ImageCodecInfo.GetImageEncoders())
+                        if (c.MimeType == "image/jpeg") { codec = c; break; }
+                    EncoderParameters eps = new EncoderParameters(1);
+                    eps.Param[0] = new EncoderParameter(Encoder.Quality, 55L);
+                    if (codec != null) small.Save(ms, codec, eps); else small.Save(ms, ImageFormat.Jpeg);
+                    string b64 = Convert.ToBase64String(ms.ToArray());
+                    string tid = Guid.NewGuid().ToString("N").Substring(0, 8);
+                    int total = (b64.Length + 799) / 800;
+                    for (int i = 0; i < total; i++)
+                    {
+                        string chunk = b64.Substring(i * 800, Math.Min(800, b64.Length - i * 800));
+                        SendFast("thimg " + to + " " + tid + " " + i + " " + total + " " + chunk);
+                    }
+                }
+            }
+        }
+        catch (Exception ex) { Log("サムネ送信に失敗: " + ex.Message); }
+    }
+
     private static void ReceiveCursor(string kind, string[] rest, string from)
     {
         // rest[0] は宛先ID
@@ -780,6 +820,7 @@ internal static class Program
             return;
         }
         if (kind == "identify") { ShowIdentify(); return; }
+        if (kind == "threq") { SendThumb(from); return; }
         if (kind == "enter")
         {
             if (holding || forwardTo != null || args.Length < 1) return;

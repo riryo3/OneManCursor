@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-28"
+let buildTag = "Build 20261030-29"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1345,6 +1345,9 @@ final class CursorShare {
             }
         case "kd", "ku", "fl":
             guard args.count == 2, let code = UInt16(args[0]), let flagsRaw = UInt64(args[1]) else { return }
+            if kind == "fl" || code == 126 || code == 99 {
+                NetLog.shared.log("キー適用: \(kind) code=\(code) flags=\(flagsRaw)")
+            }
             if let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: kind != "ku") {
                 e.flags = CGEventFlags(rawValue: flagsRaw)
                 if kind == "fl" { e.type = .flagsChanged }
@@ -2406,17 +2409,30 @@ final class SwitchSync {
     }
 
     private func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags) {
-        // 修飾キーは flagsChanged として独立に送らないと Dock のショートカット判定に届かない
-        // (セッションのキー転送と同じ方式。flags 欄だけの合成では MC が開かないことを実機で確認)
+        // 修飾キーは flagsChanged として独立に送り、さらに本体キーとは間隔を空けて送る。
+        // 一息に全部送ると Dock のショートカット判定が修飾キーの変化を取りこぼす疑いがあるため、
+        // 人間の押下(修飾キーを押してから本体キー)に近づける
         var mods: [(CGKeyCode, CGEventFlags)] = []
         if flags.contains(.maskControl) { mods.append((59, .maskControl)) }
         if flags.contains(.maskCommand) { mods.append((55, .maskCommand)) }
         if flags.contains(.maskAlternate) { mods.append((58, .maskAlternate)) }
         if flags.contains(.maskShift) { mods.append((56, .maskShift)) }
+        NetLog.shared.log("キー合成: code=\(keyCode) flags=\(flags.rawValue)")
         for (mc, fl) in mods { postOne(mc, down: true, flags: fl, flagsChanged: true) }
-        postOne(keyCode, down: true, flags: flags, flagsChanged: false)
-        postOne(keyCode, down: false, flags: flags, flagsChanged: false)
-        for (mc, _) in mods.reversed() { postOne(mc, down: false, flags: [], flagsChanged: true) }
+        let step = 0.06
+        let keyDelay = mods.isEmpty ? 0.0 : step
+        DispatchQueue.main.asyncAfter(deadline: .now() + keyDelay) { [weak self] in
+            self?.postOne(keyCode, down: true, flags: flags, flagsChanged: false)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + keyDelay + step) { [weak self] in
+            self?.postOne(keyCode, down: false, flags: flags, flagsChanged: false)
+        }
+        if !mods.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + keyDelay + step * 2) { [weak self] in
+                guard let self else { return }
+                for (mc, _) in mods.reversed() { self.postOne(mc, down: false, flags: [], flagsChanged: true) }
+            }
+        }
     }
 
     private func postOne(_ code: CGKeyCode, down: Bool, flags: CGEventFlags, flagsChanged: Bool) {

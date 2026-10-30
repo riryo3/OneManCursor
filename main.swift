@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-43"
+let buildTag = "Build 20261030-45"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -993,10 +993,15 @@ final class CursorShare {
                 let kc = event.getIntegerValueField(.keyboardEventKeycode)
                 if kc == 49, event.flags.contains(.maskCommand) {
                     if SearchSync.shared.origin { SearchSync.shared.noteLocalEnd() } else { SearchSync.shared.noteLocalOpen() }
-                } else if SearchSync.shared.origin, kc == 53 || kc == 36 || kc == 76 {
-                    // Enter / Esc は IME の確定・取消と見分けるため、SearchSync 側で様子見して判断する
+                } else if SearchSync.shared.origin, kc == 53 {
+                    // Esc は IME の取消と見分けるため、SearchSync 側で様子見して判断する
                     SearchSync.shared.forwardKey(keycode: kc)
+                } else if SearchSync.shared.origin {
+                    // 打鍵はそのまま全端末へ転送する(Enter を含む)
+                    SearchSync.shared.forwardTypedKey(type: type, event: event)
                 }
+            } else if SearchSync.shared.origin, type == .keyUp || type == .flagsChanged {
+                SearchSync.shared.forwardTypedKey(type: type, event: event)
             } else if SearchSync.shared.origin, type == .leftMouseDown || type == .rightMouseDown {
                 SearchSync.shared.noteLocalEnd()
             }
@@ -1282,7 +1287,10 @@ final class CursorShare {
                 ThumbShare.shared.handleChunk(from: from, tid: rest[0], idx: idx, total: total, chunk: rest[3])
             }
         case "mv", "dn", "up", "sc", "kd", "ku", "fl":
-            if holding {
+            if (kind == "kd" || kind == "ku" || kind == "fl"), SearchSync.shared.receiving, !holding, forwardTo == nil {
+                // 検索の連動: 検索を開いている間に届いた打鍵は、検索への入力として再現する
+                SearchSync.shared.applyRemoteKey(kind: kind, args: rest)
+            } else if holding {
                 apply(kind, args: rest)
             } else if let fwd = forwardTo {
                 // 中継: 宛先を次の相手に書き換えてそのまま送る
@@ -2713,9 +2721,6 @@ final class SearchSync {
     private(set) var origin = false     // 自分が起点(打鍵を送る側)
     private(set) var receiving = false  // 合図を受けて検索を開いている側
     private var timer: Timer?
-    private var mirrorTimer: Timer?
-    private var lastSentQuery: String?
-    private var fieldMiss = 0
     var onNote: ((String) -> Void)?
 
     func start() {
@@ -2743,7 +2748,6 @@ final class SearchSync {
     }
     private func disarm() {
         timer?.invalidate(); timer = nil
-        mirrorTimer?.invalidate(); mirrorTimer = nil
     }
     private func timeout() {
         if origin { origin = false; sendAll("sdone") }
@@ -2757,71 +2761,39 @@ final class SearchSync {
     func noteLocalOpen() {
         guard enabled, !receiving, !origin else { return }
         origin = true
-        lastSentQuery = nil
-        fieldMiss = 0
         armTimer()
-        let mt = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in self?.mirrorTick() }
-        RunLoop.main.add(mt, forMode: .common)
-        mirrorTimer = mt
         sendAll("srch")
     }
 
-    /// 起点の特殊キー(Enter / Esc): IME の確定・取消かもしれないので、少し待って
-    /// Spotlight が閉じたかどうかで判断する(キーではなく検索欄の中身を写す方式)
+    /// 起点の Esc: IME の取消かもしれないので、少し待って Spotlight が閉じたかどうかで判断する
+    /// (本当に閉じたときだけ、全端末へ閉じる合図を送る)
     func forwardKey(keycode: Int64) {
         guard origin else { return }
-        let openTop = (keycode == 36 || keycode == 76)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             guard let self = self, self.origin else { return }
-            if self.spotlightOpen() { return }  // 変換の確定/取消だった: 欄の変化は見回りが送る
-            if openTop {
-                self.sendAll("skey", "ret")
-                self.origin = false
-                self.disarm()
-            } else {
-                self.noteLocalEnd()
-            }
+            if self.spotlightOpen() { return }  // 変換の取消だった: 何もしない
+            self.noteLocalEnd()
         }
+    }
+
+    /// 起点の打鍵を、カーソル共有と同じ kd/ku/fl の形で全端末へ送る
+    func forwardTypedKey(type: CGEventType, event: CGEvent) {
+        guard origin else { return }
+        let kind: String
+        switch type {
+        case .keyDown: kind = "kd"
+        case .keyUp: kind = "ku"
+        case .flagsChanged: kind = "fl"
+        default: return
+        }
+        let kc = event.getIntegerValueField(.keyboardEventKeycode)
+        sendAll(kind, "\(kc) \(event.flags.rawValue)")
     }
 
     /// Spotlight が開いているか(画面上のウィンドウの持ち主で見る)
     private func spotlightOpen() -> Bool {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
         return list.contains { ($0[kCGWindowOwnerName as String] as? String) == "Spotlight" }
-    }
-
-    /// 検索欄の中身を読み、変わっていたら全端末へ送る
-    private func mirrorTick() {
-        guard origin else { return }
-        guard let q = spotlightQuery() else {
-            fieldMiss += 1
-            if fieldMiss == 10 { onNote?("検索の連動: Spotlight の検索欄が読めませんでした") }
-            return
-        }
-        fieldMiss = 0
-        if q != lastSentQuery {
-            lastSentQuery = q
-            sendAll("sqry", q.isEmpty ? "~" : Data(q.utf8).base64EncodedString())
-        }
-    }
-
-    /// フォーカスのある要素から Spotlight の検索欄の文字列を読む
-    private func spotlightQuery() -> String? {
-        guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.Spotlight" }) else { return nil }
-        let sys = AXUIElementCreateSystemWide()
-        var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &ref) == .success,
-              let el = ref else { return nil }
-        let focused = el as! AXUIElement
-        var pid: pid_t = 0
-        AXUIElementGetPid(focused, &pid)
-        guard pid == app.processIdentifier else { return nil }
-        var roleRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(focused, kAXRoleAttribute as CFString, &roleRef) == .success,
-              let role = roleRef as? String, role == "AXTextField" || role == "AXSearchField" else { return nil }
-        var valRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(focused, kAXValueAttribute as CFString, &valRef) == .success else { return nil }
-        return valRef as? String ?? ""
     }
 
     /// 起点の検索終了: 他端末の検索も閉じる
@@ -2869,6 +2841,23 @@ final class SearchSync {
         receiving = false
         disarm()
         postKeyCode(53)
+    }
+
+    /// 受け側: 起点から届いた打鍵(kd/ku/fl)をそのまま再現する。
+    /// 自分の検索が最前面でなければ、閉じられたとみなして事故防止のため止める
+    func applyRemoteKey(kind: String, args: [String]) {
+        guard receiving, args.count == 2, let code = UInt16(args[0]), let flagsRaw = UInt64(args[1]) else { return }
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Spotlight" else {
+            receiving = false
+            disarm()
+            return
+        }
+        if let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: kind != "ku") {
+            e.flags = CGEventFlags(rawValue: flagsRaw)
+            if kind == "fl" { e.type = .flagsChanged }
+            CursorShare.markSynthetic(e)
+            e.post(tap: .cghidEventTap)
+        }
     }
 
     // MARK: キーの合成

@@ -41,7 +41,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261030-43";
+    private const string BuildTag = "Build 20261030-45";
 
     private static string SpecId(string spec)
     {
@@ -817,6 +817,13 @@ internal static class Program
         if (kind == "sdone")
         {
             if (searching) { searching = false; PressKey(0x1B); }
+            return;
+        }
+        if ((kind == "kd" || kind == "ku" || kind == "fl") && searching)
+        {
+            // 検索の連動: 起点の打鍵をそのまま再現する。検索が最前面でなければ事故防止に終了
+            if (!IsForegroundSearch()) { searching = false; return; }
+            ApplyCursor(kind, args);
             return;
         }
         if (kind == "identify") { ShowIdentify(); return; }

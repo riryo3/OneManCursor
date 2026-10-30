@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261030-38"
+let buildTag = "Build 20261030-39"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -969,6 +969,9 @@ final class CursorShare {
             let kc = event.getIntegerValueField(.keyboardEventKeycode)
             if kc == 126, event.flags.contains(.maskControl), !event.flags.contains(.maskCommand) {
                 SwitchSync.shared.noteOpenKey()
+            } else if kc == 125, event.flags.contains(.maskControl), !event.flags.contains(.maskCommand) {
+                // Ctrl+↓ (App Exposé): 「開く」専用の合図
+                SwitchSync.shared.noteExposeKey()
             } else if kc == 99, !event.flags.contains(.maskCommand) {
                 // MCキー(F3): 標準キーとして届く場合
                 SwitchSync.shared.noteOpenKey()
@@ -2407,6 +2410,13 @@ final class SwitchSync {
         guard enabled else { return }
         NetLog.shared.log("MC検知: noteOpenKey (switching=\(switching))")
         if switching { decide(reason: "キーのトグル") } else { noteLocalOpen() }
+    }
+
+    /// Ctrl+↓ (App Exposé): 「開く」専用。切り替え中に押しても確定にはしない
+    func noteExposeKey() {
+        guard enabled, !switching else { return }
+        NetLog.shared.log("MC検知: Ctrl+↓")
+        noteLocalOpen()
     }
 
     /// トラックパッドの4本指縦スワイプ(Engine が検知): 上下とも一覧を開く操作。

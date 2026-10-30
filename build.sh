@@ -5,6 +5,9 @@ set -e
 cd "$(dirname "$0")"
 
 APP="OneManCursor.app"
+# ソースのビルド番号を表示する(どの版を作っているか一目で分かるように)
+BUILD_TAG=$(grep -o '"Build [0-9-]*"' main.swift | head -1 | tr -d '"')
+echo "ビルド番号: $BUILD_TAG"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
@@ -32,7 +35,7 @@ else
     echo "署名: 場当たり（Apple Development 証明書が見つかりませんでした）"
     codesign --force --deep --sign - "$APP"
 fi
-echo "できた: $APP"
+echo "できた: $APP（$BUILD_TAG）"
 
 # 配布用: sh build.sh dist
 # 自分用の署名(証明書名に Apple ID のメアドが入る)をはがして場当たり署名に付け替え、
@@ -47,5 +50,5 @@ if [ "$1" = "dist" ]; then
         exit 1
     fi
     (cd dist && ditto -c -k --keepParent "$APP" "OneManCursor.zip")
-    echo "配布用できた: dist/OneManCursor.zip（署名は場当たり署名に付け替え済み）"
+    echo "配布用できた: dist/OneManCursor.zip（$BUILD_TAG、署名は場当たり署名に付け替え済み）"
 fi

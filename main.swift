@@ -2371,11 +2371,6 @@ final class SwitchSync {
     private(set) var switching = false
     private var timer: Timer?
     private var observer: NSObjectProtocol?
-    private var mcPollTimer: Timer?
-    private var mcClosedStreak = 0
-    private var mcSeenVisible = false
-    private var flagSetAt = Date.distantPast
-    private var mcVisibleSince: Date?   // 一覧の画面が見え始めた時刻
     var onNote: ((String) -> Void)?
 
     func start() {
@@ -2479,70 +2474,12 @@ final class SwitchSync {
         timer?.invalidate()
         timer = nil
         if on {
-            flagSetAt = Date()
-            mcClosedStreak = 0
-            mcSeenVisible = false
-            mcVisibleSince = nil
-            startMcPoll()
             let t = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
                 self?.setFlag(false)
             }
             RunLoop.main.add(t, forMode: .common)
             timer = t
-        } else {
-            stopMcPoll()
         }
-    }
-
-    /// 一覧表示中だけ画面を見張る。アプリ切替の通知が来ない確定(最前面だった
-    /// アプリのウィンドウを選んだ場合など)を取りこぼさないための保険
-    private func startMcPoll() {
-        mcPollTimer?.invalidate()
-        let t = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            self?.mcPollTick()
-        }
-        RunLoop.main.add(t, forMode: .common)
-        mcPollTimer = t
-    }
-
-    private func stopMcPoll() {
-        mcPollTimer?.invalidate()
-        mcPollTimer = nil
-    }
-
-    private func mcPollTick() {
-        guard switching else { stopMcPoll(); return }
-        if mcVisible() {
-            if mcVisibleSince == nil { mcVisibleSince = Date() }
-            mcSeenVisible = true
-            mcClosedStreak = 0
-            return
-        }
-        // 一覧の画面が一度も見えていない間は判定しない(開くアニメーションの途中や、
-        // 合図で開けなかった場合に「閉じた」と誤認しないため)
-        guard mcSeenVisible else { return }
-        // 見え始めてから間もないうちも判定しない。開くアニメーションの間に
-        // 画面(Dock のウィンドウ)が入れ替わって、一時的に見えなくなるため
-        guard let since = mcVisibleSince, Date().timeIntervalSince(since) >= 2.0 else { return }
-        mcClosedStreak += 1
-        if mcClosedStreak >= 3 {
-            NetLog.shared.log("MC終了を検知: 画面")
-            decide(reason: "MC終了(画面)")
-        }
-    }
-
-    /// Mission Control / Exposé が開いているかの推定(Dock が画面全体サイズの
-    /// ウィンドウを出しているか)。cursor.swift で実績のある判定と同じ方式
-    private func mcVisible() -> Bool {
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
-        for w in list {
-            guard (w[kCGWindowOwnerName as String] as? String) == "Dock",
-                  let b = w[kCGWindowBounds as String] as? [String: Any],
-                  let sw = (b["Width"] as? NSNumber)?.doubleValue,
-                  let sh = (b["Height"] as? NSNumber)?.doubleValue else { continue }
-            for s in NSScreen.screens where sw >= Double(s.frame.width) * 0.9 && sh >= Double(s.frame.height) * 0.9 { return true }
-        }
-        return false
     }
 
     /// 本物のキーイベントが持っている flags を再現する。

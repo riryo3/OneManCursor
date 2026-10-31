@@ -18,10 +18,14 @@ compiler that ships with Windows.
 
 ■ Launching
 Launch OneManCursor.exe.
+   - If "Windows protected your PC" (Microsoft Defender SmartScreen) appears:
+     Click "More info", then select "Run anyway"
    - The first time, you will be asked to allow it through the firewall.
      Allow it on "Private networks"
    - No window opens; it stays resident in the system tray with a "ワ" icon (the Japanese katakana "wa", from "ワンマン" = "one-man")
    - You can check your own ID from the right-click menu of the tray icon
+   - Solo mode: right-click the tray icon → "Solo mode" (while on, cursor will not
+     leave to other machines and arriving cursors are returned)
    - To view the log: right-click the tray icon → "Show Log"
    - To quit:         right-click the tray icon → "Exit"
    - Settings are saved in OneManCursor.ini in the same folder

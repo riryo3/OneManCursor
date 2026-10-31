@@ -3233,7 +3233,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         diagItem.target = self
         let permItem = NSMenuItem(title: "デバイスの制御とデータへのアクセスの許可を開く…", action: #selector(openPermSettings), keyEquivalent: "")
         permItem.target = self
-        let screenItem = NSMenuItem(title: "画面収録とシステムオーディオの録音の許可を開く…", action: #selector(openScreenSettings), keyEquivalent: "")
+        let screenItem = NSMenuItem(title: "画面収録とシステムオーディオ録音の許可を開く…", action: #selector(openScreenSettings), keyEquivalent: "")
         screenItem.target = self
         let inputItem = NSMenuItem(title: "入力監視の許可を開く…", action: #selector(openInputSettings), keyEquivalent: "")
         inputItem.target = self

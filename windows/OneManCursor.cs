@@ -41,7 +41,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261031-57";
+    private const string BuildTag = "Build 20261031-58";
 
     private static string SpecId(string spec)
     {
@@ -755,7 +755,8 @@ internal static class Program
         }
     }
 
-    private static GlowForm glowT, glowB, glowL, glowR, glowSeg;
+    private static GlowForm glowT, glowB, glowL, glowR;
+    private static GlowForm[] glowSegs;
     private static string glowKey = "";
 
     private static GlowForm MakeGlowStrip()
@@ -768,9 +769,11 @@ internal static class Program
         return f;
     }
 
-    private static void HideGlow() { SetGlow("", Color.Black, null, 0, 0); }
+    private struct GlowSegInfo { public string Dir; public double S; public double E; public Color C; }
 
-    private static void SetGlow(string key, Color color, string dir, double s, double e)
+    private static void HideGlow() { SetGlow("", Color.Black, null); }
+
+    private static void SetGlow(string key, Color outlineColor, GlowSegInfo[] segs)
     {
         if (uiCtx == null) return;
         if (key == glowKey) return;
@@ -783,27 +786,44 @@ internal static class Program
                 {
                     glowT = MakeGlowStrip(); glowB = MakeGlowStrip();
                     glowL = MakeGlowStrip(); glowR = MakeGlowStrip();
-                    glowSeg = MakeGlowStrip();
+                    glowSegs = new GlowForm[] { MakeGlowStrip(), MakeGlowStrip(), MakeGlowStrip(), MakeGlowStrip() };
                 }
-                if (key.Length == 0)
+                if (key.Length == 0 || segs == null)
                 {
-                    glowT.Hide(); glowB.Hide(); glowL.Hide(); glowR.Hide(); glowSeg.Hide();
+                    glowT.Hide(); glowB.Hide(); glowL.Hide(); glowR.Hide();
+                    foreach (GlowForm f in glowSegs) f.Hide();
                     return;
                 }
                 int bx = ScrX, by = ScrY, bw = ScrW, bh = ScrH;
                 foreach (GlowForm f in new GlowForm[] { glowT, glowB, glowL, glowR })
-                { f.BackColor = color; f.Opacity = 0.30; }
+                { f.BackColor = outlineColor; f.Opacity = 0.30; }
                 glowT.Bounds = new Rectangle(bx, by, bw, 5);
                 glowB.Bounds = new Rectangle(bx, by + bh - 5, bw, 5);
                 glowL.Bounds = new Rectangle(bx, by, 5, bh);
                 glowR.Bounds = new Rectangle(bx + bw - 5, by, 5, bh);
-                glowSeg.BackColor = color; glowSeg.Opacity = 0.95;
-                if (dir == "left") glowSeg.Bounds = new Rectangle(bx, by + (int)(s * bh), 7, Math.Max(2, (int)((e - s) * bh)));
-                else if (dir == "right") glowSeg.Bounds = new Rectangle(bx + bw - 7, by + (int)(s * bh), 7, Math.Max(2, (int)((e - s) * bh)));
-                else if (dir == "up") glowSeg.Bounds = new Rectangle(bx + (int)(s * bw), by, Math.Max(2, (int)((e - s) * bw)), 7);
-                else glowSeg.Bounds = new Rectangle(bx + (int)(s * bw), by + bh - 7, Math.Max(2, (int)((e - s) * bw)), 7);
-                glowT.Show(); glowB.Show(); glowL.Show(); glowR.Show(); glowSeg.Show();
-                glowSeg.BringToFront();
+                glowT.Show(); glowB.Show(); glowL.Show(); glowR.Show();
+                for (int i = 0; i < glowSegs.Length; i++)
+                {
+                    GlowForm f = glowSegs[i];
+                    if (i >= segs.Length) { f.Hide(); continue; }
+                    GlowSegInfo g = segs[i];
+                    f.BackColor = g.C; f.Opacity = 0.95;
+                    // 区間の両端に余白を空け、隣同士の色が混ざらないようにする
+                    if (g.Dir == "left" || g.Dir == "right")
+                    {
+                        int y0 = by + (int)(g.S * bh), len = (int)((g.E - g.S) * bh);
+                        if (len > 24) { y0 += 10; len -= 20; }
+                        f.Bounds = new Rectangle(g.Dir == "left" ? bx : bx + bw - 7, y0, 7, Math.Max(2, len));
+                    }
+                    else
+                    {
+                        int x0 = bx + (int)(g.S * bw), len = (int)((g.E - g.S) * bw);
+                        if (len > 24) { x0 += 10; len -= 20; }
+                        f.Bounds = new Rectangle(x0, g.Dir == "up" ? by : by + bh - 7, Math.Max(2, len), 7);
+                    }
+                    f.Show();
+                    f.BringToFront();
+                }
             }
             catch (Exception) { }
         }, null);
@@ -837,17 +857,36 @@ internal static class Program
     {
         if (!holding || forwardTo != null) { HideGlow(); return; }
         double x = vx - ScrX, y = vy - ScrY;
-        string dir = null; double ratio = 0;
-        if (x <= 56) { dir = "left"; ratio = y / Math.Max(1, ScrH); }
-        else if (x >= ScrW - 56) { dir = "right"; ratio = y / Math.Max(1, ScrH); }
-        else if (y <= 56) { dir = "up"; ratio = x / Math.Max(1, ScrW); }
-        else if (y >= ScrH - 56) { dir = "down"; ratio = x / Math.Max(1, ScrW); }
-        if (dir == null) { HideGlow(); return; }
-        PeerLinkC l = FindLink(dir, ratio);
-        if (l == null) { HideGlow(); return; }
-        double s, e;
-        SpecSpan(l.Spec, out s, out e);
-        SetGlow(dir + "|" + l.Id + "|" + s + "|" + e, PeerColor(l.Id), dir, s, e);
+        // 近くにある入り口を全部同時に光らせる (角では複数の辺が対象になる)
+        List<GlowSegInfo> found = new List<GlowSegInfo>();
+        List<double> dists = new List<double>();
+        foreach (string dir in new string[] { "left", "right", "up", "down" })
+        {
+            double dist, ratio;
+            if (dir == "left") { dist = x; ratio = y / Math.Max(1, ScrH); }
+            else if (dir == "right") { dist = ScrW - x; ratio = y / Math.Max(1, ScrH); }
+            else if (dir == "up") { dist = y; ratio = x / Math.Max(1, ScrW); }
+            else { dist = ScrH - y; ratio = x / Math.Max(1, ScrW); }
+            if (dist > 56) continue;
+            PeerLinkC l = FindLink(dir, ratio);
+            if (l == null) continue;
+            double s, e;
+            SpecSpan(l.Spec, out s, out e);
+            GlowSegInfo g;
+            g.Dir = dir; g.S = s; g.E = e; g.C = PeerColor(l.Id);
+            found.Add(g); dists.Add(dist);
+        }
+        if (found.Count == 0) { HideGlow(); return; }
+        // 一番近い入り口を先頭に (輪郭全体の色に使う)
+        for (int i = 1; i < found.Count; i++)
+        {
+            GlowSegInfo g = found[i]; double d = dists[i]; int j = i - 1;
+            while (j >= 0 && dists[j] > d) { found[j + 1] = found[j]; dists[j + 1] = dists[j]; j--; }
+            found[j + 1] = g; dists[j + 1] = d;
+        }
+        string key = "";
+        foreach (GlowSegInfo g in found) key += g.Dir + "|" + g.S + "|" + g.E + "|" + g.C.ToArgb() + ";";
+        SetGlow(key, found[0].C, found.ToArray());
     }
 
     private static DateTime lastThumbAt = DateTime.MinValue;

@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-57"
+let buildTag = "Build 20261031-58"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1097,13 +1097,16 @@ final class CursorShare {
             (.down, Double(b.maxY) - Double(loc.y), (Double(loc.x) - Double(b.minX)) / Double(b.width)),
             (.up, Double(loc.y) - Double(b.minY), (Double(loc.x) - Double(b.minX)) / Double(b.width)),
         ]
+        var found: [(dir: PartnerDir, link: PeerLink, dist: Double)] = []
         for (dir, dist, ratio) in spots where dist <= 56 {
-            if let lk = link(dir: dir, at: ratio) {
-                EdgeGlow.shared.show(dir: dir, link: lk)
-                return
-            }
+            if let lk = link(dir: dir, at: ratio) { found.append((dir: dir, link: lk, dist: dist)) }
         }
-        EdgeGlow.shared.hide()
+        if found.isEmpty {
+            EdgeGlow.shared.hide()
+        } else {
+            found.sort { $0.dist < $1.dist }
+            EdgeGlow.shared.show(segments: found.map { (dir: $0.dir, link: $0.link) })
+        }
     }
 
     /// 保持中: 仮想カーソルの端への近さでボーダーを示す
@@ -1115,13 +1118,16 @@ final class CursorShare {
             (.down, Double(b.maxY) - vy, (vx - Double(b.minX)) / Double(b.width)),
             (.up, vy - Double(b.minY), (vx - Double(b.minX)) / Double(b.width)),
         ]
+        var found: [(dir: PartnerDir, link: PeerLink, dist: Double)] = []
         for (dir, dist, ratio) in spots where dist <= 56 {
-            if let lk = link(dir: dir, at: ratio) {
-                EdgeGlow.shared.show(dir: dir, link: lk)
-                return
-            }
+            if let lk = link(dir: dir, at: ratio) { found.append((dir: dir, link: lk, dist: dist)) }
         }
-        EdgeGlow.shared.hide()
+        if found.isEmpty {
+            EdgeGlow.shared.hide()
+        } else {
+            found.sort { $0.dist < $1.dist }
+            EdgeGlow.shared.show(segments: found.map { (dir: $0.dir, link: $0.link) })
+        }
     }
 
     /// 端に触れていたら相手に渡す。渡したら true
@@ -1597,20 +1603,15 @@ final class EdgeGlow {
     private var timer: Timer?
     fileprivate var alpha = 0.0
     private var targetAlpha = 0.0
-    fileprivate var dir: PartnerDir = .right
-    fileprivate var color: NSColor = .systemBlue
-    fileprivate var segStart = 0.0
-    fileprivate var segEnd = 1.0
+    fileprivate var segs: [(dir: PartnerDir, color: NSColor, start: Double, end: Double)] = []
 
-    func show(dir: PartnerDir, link lk: PeerLink) {
-        let c = colorFromHex(machineColorHex(of: lk.id))
+    /// 近くにある入り口を全部同時に光らせる(角では複数の辺が同時に対象になる)
+    func show(segments: [(dir: PartnerDir, link: PeerLink)]) {
+        let mapped = segments.map { (dir: $0.dir, color: colorFromHex(machineColorHex(of: $0.link.id)), start: $0.link.start, end: $0.link.end) }
         onMain { [weak self] in
             guard let self = self else { return }
             self.ensureWindow()
-            self.dir = dir
-            self.color = c
-            self.segStart = lk.start
-            self.segEnd = lk.end
+            self.segs = mapped
             self.targetAlpha = 1
             self.startTimer()
         }
@@ -1671,43 +1672,45 @@ final class EdgeGlowView: NSView {
     weak var owner: EdgeGlow?
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let o = owner, o.alpha > 0.01 else { return }
+        guard let o = owner, o.alpha > 0.01, let first = o.segs.first else { return }
         let a = CGFloat(o.alpha)
-        let col = o.color
-        // 輪郭全体をうっすら
+        // 輪郭全体をうっすら(色は一番近い入り口のもの)
         let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: 3, dy: 3), xRadius: 14, yRadius: 14)
-        col.withAlphaComponent(0.30 * a).setStroke()
+        first.color.withAlphaComponent(0.30 * a).setStroke()
         outline.lineWidth = 4
         outline.stroke()
-        // 行き先の区間を強く(影でぼかす)
+        // 行き先の区間を強く(影でぼかす)。区間の両端には余白を空け、隣同士の色が混ざらないようにする
         let w = Double(bounds.width), h = Double(bounds.height)
-        let s = o.segStart, e = o.segEnd
-        let seg = NSBezierPath()
-        switch o.dir {
-        case .right:
-            seg.move(to: NSPoint(x: w - 4, y: h * (1 - s)))
-            seg.line(to: NSPoint(x: w - 4, y: h * (1 - e)))
-        case .left:
-            seg.move(to: NSPoint(x: 4, y: h * (1 - s)))
-            seg.line(to: NSPoint(x: 4, y: h * (1 - e)))
-        case .down:
-            seg.move(to: NSPoint(x: w * s, y: 4))
-            seg.line(to: NSPoint(x: w * e, y: 4))
-        case .up:
-            seg.move(to: NSPoint(x: w * s, y: h - 4))
-            seg.line(to: NSPoint(x: w * e, y: h - 4))
+        let margin = 10.0
+        for si in o.segs {
+            let seg = NSBezierPath()
+            switch si.dir {
+            case .right, .left:
+                let x = si.dir == .right ? w - 4 : 4
+                var y1 = h * (1 - si.start), y2 = h * (1 - si.end)
+                if y1 > y2 { swap(&y1, &y2) }
+                if y2 - y1 > margin * 2 + 4 { y1 += margin; y2 -= margin }
+                seg.move(to: NSPoint(x: x, y: y1))
+                seg.line(to: NSPoint(x: x, y: y2))
+            case .down, .up:
+                let y = si.dir == .down ? 4.0 : h - 4
+                var x1 = w * si.start, x2 = w * si.end
+                if x2 - x1 > margin * 2 + 4 { x1 += margin; x2 -= margin }
+                seg.move(to: NSPoint(x: x1, y: y))
+                seg.line(to: NSPoint(x: x2, y: y))
+            }
+            let shadow = NSShadow()
+            shadow.shadowColor = si.color.withAlphaComponent(0.9 * a)
+            shadow.shadowBlurRadius = 12
+            shadow.shadowOffset = .zero
+            NSGraphicsContext.saveGraphicsState()
+            shadow.set()
+            si.color.withAlphaComponent(0.95 * a).setStroke()
+            seg.lineWidth = 5
+            seg.lineCapStyle = .round
+            seg.stroke()
+            NSGraphicsContext.restoreGraphicsState()
         }
-        let shadow = NSShadow()
-        shadow.shadowColor = col.withAlphaComponent(0.9 * a)
-        shadow.shadowBlurRadius = 12
-        shadow.shadowOffset = .zero
-        NSGraphicsContext.saveGraphicsState()
-        shadow.set()
-        col.withAlphaComponent(0.95 * a).setStroke()
-        seg.lineWidth = 5
-        seg.lineCapStyle = .round
-        seg.stroke()
-        NSGraphicsContext.restoreGraphicsState()
     }
 }
 

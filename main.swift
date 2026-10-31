@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-64"
+let buildTag = "Build 20261031-65"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1465,6 +1465,7 @@ final class CursorShare {
             postMouse(down: kind == "dn", button: n)
         case "sc":
             guard args.count == 2, let dy = Int32(args[0]), let dx = Int32(args[1]) else { return }
+            if holding, browserSwipeConvert(dy: dy, dx: dx) { return }
             if let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) {
                 e.location = CGPoint(x: vx, y: vy)
                 e.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
@@ -1484,6 +1485,57 @@ final class CursorShare {
         default:
             break
         }
+    }
+
+    // MARK: ブラウザでの横スワイプ変換(受け側)
+
+    /// ブラウザが最前面のとき、共有越しの横スクロールの流れを「戻る/進む」に変換する。
+    /// 共有越しのスクロールは素のホイール信号で届くため、Chrome 等の
+    /// 「スワイプで履歴移動」が成立しない。その受け皿として、受け側で
+    /// 最前面アプリを認識し、横方向に勢いのあるスクロールを ⌘[ / ⌘] に変える。
+    private static let browserIDs: Set<String> = [
+        "com.google.Chrome", "com.google.Chrome.canary", "com.apple.Safari",
+        "com.microsoft.edgemac", "org.mozilla.firefox", "company.thebrowser.Browser",
+        "com.brave.Browser", "com.operasoftware.Opera", "com.vivaldi.Vivaldi",
+    ]
+    private var swipeAccX = 0.0, swipeAccY = 0.0
+    private var swipeStartT = 0.0, swipeLastT = 0.0
+    private var swipeCoolUntil = 0.0
+
+    /// 変換したら true(そのスクロールはブラウザへ流さない)
+    private func browserSwipeConvert(dy: Int32, dx: Int32) -> Bool {
+        guard let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+              Self.browserIDs.contains(bid) else { return false }
+        let now = Date().timeIntervalSince1970
+        if now < swipeCoolUntil { return abs(dx) >= abs(dy) }   // 発火直後: 横成分だけ飲み込む
+        if now - swipeLastT > 0.30 { swipeAccX = 0; swipeAccY = 0; swipeStartT = now }
+        swipeLastT = now
+        swipeAccX += Double(dx); swipeAccY += Double(dy)
+        if abs(swipeAccX) >= 350, abs(swipeAccX) >= 2.5 * abs(swipeAccY), now - swipeStartT <= 1.0 {
+            let back = swipeAccX < 0
+            NetLog.shared.log("ブラウザスワイプ変換: \(back ? "戻る" : "進む") (dx合計=\(Int(swipeAccX)) dy合計=\(Int(swipeAccY)) app=\(bid))")
+            swipeAccX = 0; swipeAccY = 0
+            swipeCoolUntil = now + 0.8
+            postLocalCmdKey(back ? 33 : 30)
+            return true
+        }
+        return false
+    }
+
+    /// 受け側のマシン自身に ⌘+キー を合成する(ブラウザスワイプ変換用)
+    private func postLocalCmdKey(_ code: CGKeyCode) {
+        let cmd = CGEventFlags.maskCommand
+        func post(_ type: CGEventType, key: CGKeyCode, flags: CGEventFlags) {
+            guard let e = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: type == .keyDown) else { return }
+            e.flags = flags
+            if type == .flagsChanged { e.type = .flagsChanged }
+            e.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
+            e.post(tap: .cghidEventTap)
+        }
+        post(.flagsChanged, key: 55, flags: cmd)
+        post(.keyDown, key: code, flags: cmd)
+        post(.keyUp, key: code, flags: cmd)
+        post(.flagsChanged, key: 55, flags: [])
     }
 
     private func warp() {

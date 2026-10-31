@@ -41,7 +41,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261031-63";
+    private const string BuildTag = "Build 20261031-64";
 
     private static string SpecId(string spec)
     {
@@ -1203,6 +1203,13 @@ internal static class Program
             };
             menu.Items.Add(soloItem);
             menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("再起動", null, delegate
+            {
+                // 二重起動防止の Mutex を先に手放さないと、新しいプロセスが弾かれる
+                try { singleMutex.ReleaseMutex(); singleMutex.Close(); } catch { }
+                icon.Visible = false;
+                Application.Restart();
+            });
             menu.Items.Add("終了", null, delegate { Exit(); });
             InstallSwitchHooks();
             uiCtx = System.Threading.SynchronizationContext.Current;

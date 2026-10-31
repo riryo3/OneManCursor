@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-68"
+let buildTag = "Build 20261031-69"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1185,6 +1185,26 @@ final class CursorShare {
         return scrollSuppressEngaged
     }
 
+    // スクロール転送の軸ロック: ひと続きのスクロールは、勢いのある方向の軸だけを通す
+    // (横スワイプのつもりでも指の縦ズレで相手が上下にスクロールしてしまうのを防ぐ)
+    private var scAccX = 0.0, scAccY = 0.0, scLastT = 0.0
+    private var scLockH: Bool? = nil
+    private func axisLockedScroll(dy: Double, dx: Double) -> (Double, Double) {
+        let now = Date().timeIntervalSince1970
+        if now - scLastT > 0.25 { scAccX = 0; scAccY = 0; scLockH = nil }
+        scLastT = now
+        scAccX += dx; scAccY += dy
+        if scLockH == nil, max(abs(scAccX), abs(scAccY)) >= 40 {
+            if abs(scAccX) >= 1.5 * abs(scAccY) { scLockH = true }
+            else if abs(scAccY) >= 1.5 * abs(scAccX) { scLockH = false }
+        }
+        switch scLockH {
+        case .some(true): return (0, dx)
+        case .some(false): return (dy, 0)
+        case .none: return (dy, dx)
+        }
+    }
+
     /// 共有中のスワイプを相手へ送ってよいか(相手のアプリで判断する)
     func swipeAllowedRemotely(_ action: SwipeAction) -> Bool {
         guard let bid = remoteAppID, remoteAppPeer == awayTo else { return true }
@@ -1322,7 +1342,8 @@ final class CursorShare {
             if scrollSuppressed { return }
             let dy = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)
             let dx = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
-            if dx != 0 || dy != 0 { LinkNet.sendFast("sc \(to) \(Int(dy)) \(Int(dx))") }
+            let (sdy, sdx) = axisLockedScroll(dy: dy, dx: dx)
+            if sdx != 0 || sdy != 0 { LinkNet.sendFast("sc \(to) \(Int(sdy)) \(Int(sdx))") }
         case .keyDown:
             LinkNet.sendFast("kd \(to) \(event.getIntegerValueField(.keyboardEventKeycode)) \(event.flags.rawValue)")
         case .keyUp:

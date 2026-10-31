@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-59"
+let buildTag = "Build 20261031-60"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1097,15 +1097,12 @@ final class CursorShare {
             (.down, Double(b.maxY) - Double(loc.y), (Double(loc.x) - Double(b.minX)) / Double(b.width)),
             (.up, Double(loc.y) - Double(b.minY), (Double(loc.x) - Double(b.minX)) / Double(b.width)),
         ]
-        var found: [(dir: PartnerDir, link: PeerLink, dist: Double)] = []
-        for (dir, dist, _) in spots where dist <= 56 {
-            // 近づいた辺については、カーソルの位置にある区間だけでなく、その辺で移動できる区間を全部光らせる
-            for lk in links where lk.dir == dir { found.append((dir: dir, link: lk, dist: dist)) }
-        }
-        if found.isEmpty {
-            EdgeGlow.shared.hide()
+        // いずれかの移動先(リンクのある辺)に近づいたら、移動先を全部光らせる
+        let near = spots.contains { (dir, dist, _) in dist <= 56 && links.contains { $0.dir == dir } }
+        if near && !links.isEmpty {
+            EdgeGlow.shared.show(segments: links.map { (dir: $0.dir, link: $0) })
         } else {
-            EdgeGlow.shared.show(segments: found.map { (dir: $0.dir, link: $0.link) })
+            EdgeGlow.shared.hide()
         }
     }
 
@@ -1118,15 +1115,12 @@ final class CursorShare {
             (.down, Double(b.maxY) - vy, (vx - Double(b.minX)) / Double(b.width)),
             (.up, vy - Double(b.minY), (vx - Double(b.minX)) / Double(b.width)),
         ]
-        var found: [(dir: PartnerDir, link: PeerLink, dist: Double)] = []
-        for (dir, dist, _) in spots where dist <= 56 {
-            // 近づいた辺については、カーソルの位置にある区間だけでなく、その辺で移動できる区間を全部光らせる
-            for lk in links where lk.dir == dir { found.append((dir: dir, link: lk, dist: dist)) }
-        }
-        if found.isEmpty {
-            EdgeGlow.shared.hide()
+        // いずれかの移動先(リンクのある辺)に近づいたら、移動先を全部光らせる
+        let near = spots.contains { (dir, dist, _) in dist <= 56 && links.contains { $0.dir == dir } }
+        if near && !links.isEmpty {
+            EdgeGlow.shared.show(segments: links.map { (dir: $0.dir, link: $0) })
         } else {
-            EdgeGlow.shared.show(segments: found.map { (dir: $0.dir, link: $0.link) })
+            EdgeGlow.shared.hide()
         }
     }
 
@@ -1605,7 +1599,7 @@ final class EdgeGlow {
     private var targetAlpha = 0.0
     fileprivate var segs: [(dir: PartnerDir, color: NSColor, start: Double, end: Double)] = []
 
-    /// 近づいた辺の、移動できる区間を全部同時に光らせる(角では複数の辺が同時に対象になる)
+    /// 移動できる区間を全部同時に光らせる
     func show(segments: [(dir: PartnerDir, link: PeerLink)]) {
         let mapped = segments.map { (dir: $0.dir, color: colorFromHex(machineColorHex(of: $0.link.id)), start: $0.link.start, end: $0.link.end) }
         onMain { [weak self] in

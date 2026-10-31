@@ -516,11 +516,20 @@ final class CursorOverlay: NSObject {
         fillCheck.state = cur.fillOn ? .on : .off
         outlineSwatch.color = cur.color; outlineSwatch.alphaValue = cur.outlineOn ? 1 : 0.35
         fillSwatch.color = cur.fillColor; fillSwatch.alphaValue = cur.fillOn ? 1 : 0.35
+        // 本物そっくりは本物のカーソル画像をそのまま拡大するので、色・輪郭の太さ・ぼかしは
+        // 効かない。効かない設定は操作できないようにする(サイズと不透明度は効く)
+        let mirror = shape == 2
+        outlineCheck.isEnabled = !mirror
+        fillCheck.isEnabled = !mirror
+        widthRow.slider.isEnabled = !mirror; widthRow.field.isEnabled = !mirror
+        blurRow.slider.isEnabled = !mirror; blurRow.field.isEnabled = !mirror
+        if mirror { outlineSwatch.alphaValue = 0.35; fillSwatch.alphaValue = 0.35 }
     }
 
     // MARK: 色
 
     func openColorPanel(target: Int) {
+        if shape == 2, target != 2 { return }   // 本物そっくりでは色が効かない
         editingTarget = target
         let p = NSColorPanel.shared
         p.showsAlpha = true
@@ -623,18 +632,6 @@ final class CursorOverlay: NSObject {
         followRows[0].set(0); followRows[1].set(0.4); followRows[2].set(30)
     }
 
-    @objc func loginChanged(_ b: NSButton) {
-        do {
-            if b.state == .on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
-        } catch {
-            let a = NSAlert()
-            a.messageText = "ログイン項目を変更できませんでした"
-            a.informativeText = error.localizedDescription
-            a.runModal()
-        }
-        b.state = SMAppService.mainApp.status == .enabled ? .on : .off
-    }
-
     // MARK: 設定画面
 
     /// 本体メニューから形を切り替える
@@ -720,9 +717,6 @@ final class CursorOverlay: NSObject {
             let importBtn = NSButton(title: "設定を読み込む…", target: self, action: #selector(importSettings))
             let moveRow = NSStackView(views: [exportBtn, importBtn]); moveRow.spacing = 8
 
-            let login = NSButton(checkboxWithTitle: "ログイン時に自動で起動", target: self, action: #selector(loginChanged(_:)))
-            login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-
             mcCheck = NSButton(checkboxWithTitle: "Mission Control / アプリケーション Exposé の表示中は隠す", target: self, action: #selector(mcToggled(_:)))
             mcCheck.state = hideDuringMC ? .on : .off
 
@@ -732,7 +726,7 @@ final class CursorOverlay: NSObject {
                 header("追従の調整(全体共通 / 先読み 0 = なし)"), leadRow.stack, smoothRow.stack, stopRow.stack, resetFollow,
                 header("波紋(全体共通)"), rippleTop, rippleRow.stack,
                 header("設定の引っ越し(JSON)"), moveRow,
-                login, mcCheck,
+                mcCheck,
             ]
             let stack = NSStackView(views: rows)
             stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10

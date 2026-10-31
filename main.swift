@@ -875,7 +875,7 @@ final class CursorShare {
         CGWarpMouseCursorPosition(center)
         // ワープだけではイベント上の位置がずれるので、実イベントも1発流す
         if let mv = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: center, mouseButton: .left) {
-            markSynthetic(mv)
+            Self.markSynthetic(mv)
             mv.post(tap: .cghidEventTap)
         }
         NetLog.shared.log("⌘Esc: カーソルを画面中央へ移動")

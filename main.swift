@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-61"
+let buildTag = "Build 20261031-62"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -862,6 +862,25 @@ final class CursorShare {
         EdgeGlow.shared.hide()
     }
 
+    /// 非常口(⌘Esc)を押したマシン専用: 見失ったカーソルを画面の真ん中へ連れてくる。
+    /// 合図でリセットされただけの他マシンでは動かない(そちらの利用者を驚かせないため)
+    func centerCursor() {
+        let mouse = NSEvent.mouseLocation
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { return }
+        let screen = screens.first { $0.frame.contains(mouse) } ?? NSScreen.main ?? screens[0]
+        let primaryH = screens[0].frame.height
+        // NSScreen は左下原点、Quartz は左上原点なので主画面の高さで反転する
+        let center = CGPoint(x: screen.frame.midX, y: primaryH - screen.frame.midY)
+        CGWarpMouseCursorPosition(center)
+        // ワープだけではイベント上の位置がずれるので、実イベントも1発流す
+        if let mv = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: center, mouseButton: .left) {
+            markSynthetic(mv)
+            mv.post(tap: .cghidEventTap)
+        }
+        NetLog.shared.log("⌘Esc: カーソルを画面中央へ移動")
+    }
+
     private var frozenPoint: CGPoint?
     private var pinTimer: Timer?
 
@@ -1048,6 +1067,7 @@ final class CursorShare {
             if isEsc {
                 LinkNet.sendReset()
                 resetSession()
+                centerCursor()
                 status("カーソル共有： リセットしました")
                 return nil
             }
@@ -1059,7 +1079,7 @@ final class CursorShare {
         if sending {
             if awayTo == nil {
                 // カーソルは手元にある: 通常どおり通しつつ、端を監視する。⌘Esc で自分のセッション状態を掃除する
-                if isEsc { resetSession() }
+                if isEsc { resetSession(); centerCursor() }
                 if isMove(type), checkEdges(event) { return nil }
                 return Unmanaged.passUnretained(event)
             }
@@ -1067,6 +1087,7 @@ final class CursorShare {
             if isEsc {
                 LinkNet.sendReset()
                 resetSession()
+                centerCursor()
                 status("カーソル共有： 終了しました")
                 return nil
             }
@@ -1074,7 +1095,8 @@ final class CursorShare {
             return nil
         }
 
-        // 待機中: 端に触れたらセッション開始
+        // 待機中: 端に触れたらセッション開始。⌘Esc は「カーソル探し」として真ん中へ
+        if isEsc { centerCursor() }
         if isMove(type), checkEdges(event) { return nil }
         return Unmanaged.passUnretained(event)
     }

@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-66"
+let buildTag = "Build 20261031-67"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -146,6 +146,7 @@ final class Engine {
             if session && !fired && lockedCount >= 3 {
                 NetLog.shared.log("ジェスチャ不成立: 指\(lockedCount)本 dy=\(lastDy) dx=\(lastDx)")
             }
+            if session { CursorShare.shared.releaseScrollSuppress() }
             session = false; fired = false; lockedCount = 0; return
         }
         let n = downs.count
@@ -154,6 +155,7 @@ final class Engine {
 
         if !session {
             guard n >= 2 else { return }
+            CursorShare.shared.clearScrollSuppress()
             session = true; lockedCount = n; lockStableSince = timestamp
             startX = cx; startY = cy; startT = timestamp; fired = false
             return
@@ -165,6 +167,16 @@ final class Engine {
         let elapsed = timestamp - startT
 
         if lockedCount == 2 {
+            // 相手がブラウザのときは、横への「押し出し」も戻る/進むとして拾う
+            // (Chrome のスワイプはフリックより遅く長いので、通常のフリック判定では拾えない)。
+            // 指の動きそのもので判定するので、指を離した後の反動(惰性スクロール)は混ざらない
+            if CursorShare.shared.sessionActiveAway, CursorShare.shared.remoteIsBrowser {
+                if abs(dx) >= 0.06, abs(dx) >= 2 * abs(dy) { CursorShare.shared.engageScrollSuppress() }
+                if abs(dx) >= 0.15, abs(dx) >= 2 * abs(dy), elapsed <= 1.5 {
+                    fire(dx > 0 ? .back : .forward)
+                    return
+                }
+            }
             // 横フリック: 右へ = 戻る、左へ = 進む(Safari と同じ向き)
             guard elapsed >= graceTime, elapsed <= flickMaxTime else { return }
             if abs(dx) >= flickMin, abs(dx) >= 2 * abs(dy) {
@@ -1138,6 +1150,36 @@ final class CursorShare {
         }
     }
 
+    /// ブラウザとみなすアプリ(共有中のスワイプ振り分け・横スワイプ判定用)
+    private static let browserIDs: Set<String> = [
+        "com.google.Chrome", "com.google.Chrome.canary", "com.apple.Safari",
+        "com.microsoft.edgemac", "org.mozilla.firefox", "company.thebrowser.Browser",
+        "com.brave.Browser", "com.operasoftware.Opera", "com.vivaldi.Vivaldi",
+    ]
+
+    /// 相手の最前面がブラウザか(app 報告ベース)
+    var remoteIsBrowser: Bool {
+        guard let bid = remoteAppID else { return false }
+        return Self.browserIDs.contains(bid)
+    }
+
+    // ブラウザ向け横スワイプ中のスクロール転送抑制(Engine から操作する)
+    private var scrollSuppressEngaged = false
+    private var scrollSuppressUntil = 0.0
+    func engageScrollSuppress() {
+        scrollSuppressEngaged = true
+        scrollSuppressUntil = Date().timeIntervalSince1970 + 0.5
+    }
+    func releaseScrollSuppress() {
+        // 指が離れたら、反動(惰性スクロール)を食べきるまで少し延長してから解ける
+        if scrollSuppressEngaged { scrollSuppressUntil = Date().timeIntervalSince1970 + 1.2 }
+    }
+    func clearScrollSuppress() { scrollSuppressEngaged = false; scrollSuppressUntil = 0 }
+    var scrollSuppressed: Bool {
+        if scrollSuppressEngaged && Date().timeIntervalSince1970 > scrollSuppressUntil { scrollSuppressEngaged = false }
+        return scrollSuppressEngaged
+    }
+
     /// 共有中のスワイプを相手へ送ってよいか(相手のアプリで判断する)
     func swipeAllowedRemotely(_ action: SwipeAction) -> Bool {
         guard let bid = remoteAppID else { return true }
@@ -1269,6 +1311,9 @@ final class CursorShare {
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
             LinkNet.sendFast("up \(to) \(event.getIntegerValueField(.mouseEventButtonNumber))")
         case .scrollWheel:
+            // ブラウザ向け横スワイプのジェスチャ中は、そのスクロール自体を相手へ送らない
+            // (相手で横スクロールとして暴れるうえ、指を離した後の反動まで届いてしまうため)
+            if scrollSuppressed { return }
             let dy = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis1)
             let dx = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
             if dx != 0 || dy != 0 { LinkNet.sendFast("sc \(to) \(Int(dy)) \(Int(dx))") }
@@ -1505,7 +1550,6 @@ final class CursorShare {
             postMouse(down: kind == "dn", button: n)
         case "sc":
             guard args.count == 2, let dy = Int32(args[0]), let dx = Int32(args[1]) else { return }
-            if holding, browserSwipeConvert(dy: dy, dx: dx) { return }
             if let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) {
                 e.location = CGPoint(x: vx, y: vy)
                 e.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
@@ -1525,57 +1569,6 @@ final class CursorShare {
         default:
             break
         }
-    }
-
-    // MARK: ブラウザでの横スワイプ変換(受け側)
-
-    /// ブラウザが最前面のとき、共有越しの横スクロールの流れを「戻る/進む」に変換する。
-    /// 共有越しのスクロールは素のホイール信号で届くため、Chrome 等の
-    /// 「スワイプで履歴移動」が成立しない。その受け皿として、受け側で
-    /// 最前面アプリを認識し、横方向に勢いのあるスクロールを ⌘[ / ⌘] に変える。
-    private static let browserIDs: Set<String> = [
-        "com.google.Chrome", "com.google.Chrome.canary", "com.apple.Safari",
-        "com.microsoft.edgemac", "org.mozilla.firefox", "company.thebrowser.Browser",
-        "com.brave.Browser", "com.operasoftware.Opera", "com.vivaldi.Vivaldi",
-    ]
-    private var swipeAccX = 0.0, swipeAccY = 0.0
-    private var swipeStartT = 0.0, swipeLastT = 0.0
-    private var swipeCoolUntil = 0.0
-
-    /// 変換したら true(そのスクロールはブラウザへ流さない)
-    private func browserSwipeConvert(dy: Int32, dx: Int32) -> Bool {
-        guard let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
-              Self.browserIDs.contains(bid) else { return false }
-        let now = Date().timeIntervalSince1970
-        if now < swipeCoolUntil { return abs(dx) >= abs(dy) }   // 発火直後: 横成分だけ飲み込む
-        if now - swipeLastT > 0.30 { swipeAccX = 0; swipeAccY = 0; swipeStartT = now }
-        swipeLastT = now
-        swipeAccX += Double(dx); swipeAccY += Double(dy)
-        if abs(swipeAccX) >= 350, abs(swipeAccX) >= 2.5 * abs(swipeAccY), now - swipeStartT <= 1.0 {
-            let back = swipeAccX < 0
-            NetLog.shared.log("ブラウザスワイプ変換: \(back ? "戻る" : "進む") (dx合計=\(Int(swipeAccX)) dy合計=\(Int(swipeAccY)) app=\(bid))")
-            swipeAccX = 0; swipeAccY = 0
-            swipeCoolUntil = now + 0.8
-            postLocalCmdKey(back ? 33 : 30)
-            return true
-        }
-        return false
-    }
-
-    /// 受け側のマシン自身に ⌘+キー を合成する(ブラウザスワイプ変換用)
-    private func postLocalCmdKey(_ code: CGKeyCode) {
-        let cmd = CGEventFlags.maskCommand
-        func post(_ type: CGEventType, key: CGKeyCode, flags: CGEventFlags) {
-            guard let e = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: type == .keyDown) else { return }
-            e.flags = flags
-            if type == .flagsChanged { e.type = .flagsChanged }
-            e.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
-            e.post(tap: .cghidEventTap)
-        }
-        post(.flagsChanged, key: 55, flags: cmd)
-        post(.keyDown, key: code, flags: cmd)
-        post(.keyUp, key: code, flags: cmd)
-        post(.flagsChanged, key: 55, flags: [])
     }
 
     private func warp() {

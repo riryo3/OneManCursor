@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-62"
+let buildTag = "Build 20261031-63"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -524,7 +524,7 @@ enum LinkNet {
             return
         }
         if kind == "reset" {
-            CursorShare.shared.resetSession()
+            CursorShare.shared.resetFromSignal()
             return
         }
         if SwipeAction.fromWire(kind) != nil {
@@ -879,6 +879,15 @@ final class CursorShare {
             mv.post(tap: .cghidEventTap)
         }
         NetLog.shared.log("⌘Esc: カーソルを画面中央へ移動")
+    }
+
+    /// 合図でリセットされたときの処理。セッション中だったマシンはカーソルも真ん中へ
+    /// 戻す(言うことを聞かなくなったマシンを、遠くの ⌘Esc で助けるため)。
+    /// セッション外だったマシンでは状態を畳むだけ(驚かせない)
+    func resetFromSignal() {
+        let wasInSession = sending || holding || forwardTo != nil
+        resetSession()
+        if wasInSession { centerCursor() }
     }
 
     private var frozenPoint: CGPoint?

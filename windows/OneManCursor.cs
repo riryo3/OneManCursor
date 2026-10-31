@@ -41,7 +41,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261031-60";
+    private const string BuildTag = "Build 20261031-63";
 
     private static string SpecId(string spec)
     {
@@ -1298,8 +1298,14 @@ internal static class Program
             }
             if (kind == "reset")
             {
+                bool wasInSession = holding || forwardTo != null;
                 holding = false; cameFrom = null; forwardTo = null;
                 HideGlow();
+                if (wasInSession)
+                {
+                    // セッション中だったマシンは、遠くからのリセットでカーソルも真ん中へ戻す
+                    vx = ScrX + ScrW / 2; vy = ScrY + ScrH / 2; Warp();
+                }
                 Log("カーソル共有: リセットされました");
                 continue;
             }

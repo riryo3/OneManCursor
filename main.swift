@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-58"
+let buildTag = "Build 20261031-59"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -1098,13 +1098,13 @@ final class CursorShare {
             (.up, Double(loc.y) - Double(b.minY), (Double(loc.x) - Double(b.minX)) / Double(b.width)),
         ]
         var found: [(dir: PartnerDir, link: PeerLink, dist: Double)] = []
-        for (dir, dist, ratio) in spots where dist <= 56 {
-            if let lk = link(dir: dir, at: ratio) { found.append((dir: dir, link: lk, dist: dist)) }
+        for (dir, dist, _) in spots where dist <= 56 {
+            // 近づいた辺については、カーソルの位置にある区間だけでなく、その辺で移動できる区間を全部光らせる
+            for lk in links where lk.dir == dir { found.append((dir: dir, link: lk, dist: dist)) }
         }
         if found.isEmpty {
             EdgeGlow.shared.hide()
         } else {
-            found.sort { $0.dist < $1.dist }
             EdgeGlow.shared.show(segments: found.map { (dir: $0.dir, link: $0.link) })
         }
     }
@@ -1119,13 +1119,13 @@ final class CursorShare {
             (.up, vy - Double(b.minY), (vx - Double(b.minX)) / Double(b.width)),
         ]
         var found: [(dir: PartnerDir, link: PeerLink, dist: Double)] = []
-        for (dir, dist, ratio) in spots where dist <= 56 {
-            if let lk = link(dir: dir, at: ratio) { found.append((dir: dir, link: lk, dist: dist)) }
+        for (dir, dist, _) in spots where dist <= 56 {
+            // 近づいた辺については、カーソルの位置にある区間だけでなく、その辺で移動できる区間を全部光らせる
+            for lk in links where lk.dir == dir { found.append((dir: dir, link: lk, dist: dist)) }
         }
         if found.isEmpty {
             EdgeGlow.shared.hide()
         } else {
-            found.sort { $0.dist < $1.dist }
             EdgeGlow.shared.show(segments: found.map { (dir: $0.dir, link: $0.link) })
         }
     }
@@ -1605,7 +1605,7 @@ final class EdgeGlow {
     private var targetAlpha = 0.0
     fileprivate var segs: [(dir: PartnerDir, color: NSColor, start: Double, end: Double)] = []
 
-    /// 近くにある入り口を全部同時に光らせる(角では複数の辺が同時に対象になる)
+    /// 近づいた辺の、移動できる区間を全部同時に光らせる(角では複数の辺が同時に対象になる)
     func show(segments: [(dir: PartnerDir, link: PeerLink)]) {
         let mapped = segments.map { (dir: $0.dir, color: colorFromHex(machineColorHex(of: $0.link.id)), start: $0.link.start, end: $0.link.end) }
         onMain { [weak self] in
@@ -1672,13 +1672,9 @@ final class EdgeGlowView: NSView {
     weak var owner: EdgeGlow?
 
     override func draw(_ dirtyRect: NSRect) {
-        guard let o = owner, o.alpha > 0.01, let first = o.segs.first else { return }
+        guard let o = owner, o.alpha > 0.01, !o.segs.isEmpty else { return }
         let a = CGFloat(o.alpha)
-        // 輪郭全体をうっすら(色は一番近い入り口のもの)
-        let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: 3, dy: 3), xRadius: 14, yRadius: 14)
-        first.color.withAlphaComponent(0.30 * a).setStroke()
-        outline.lineWidth = 4
-        outline.stroke()
+        // 移動できる区間だけを、それぞれの行き先の色で光らせる(輪郭全体を一番近い入り口の色で光らせることはしない)
         // 行き先の区間を強く(影でぼかす)。区間の両端には余白を空け、隣同士の色が混ざらないようにする
         let w = Double(bounds.width), h = Double(bounds.height)
         let margin = 10.0

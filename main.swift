@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-65"
+let buildTag = "Build 20261031-66"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -210,9 +210,15 @@ final class Engine {
         if !enabled {
             note = "（無効中）"
         } else if CursorShare.shared.sessionActiveAway {
-            // カーソル共有で相手を操作中なら、スワイプもキー入力として相手に送る
-            CursorShare.shared.forwardActionKey(for: action)
-            note = "（カーソル共有で送信）"
+            // カーソル共有で相手を操作中なら、スワイプもキー入力として相手に送る。
+            // ただし相手のアプリに合わない動作は送らない(Chrome に ⌘O を送ると
+            // ファイルを開くダイアログが出てしまう、など)
+            if CursorShare.shared.swipeAllowedRemotely(action) {
+                CursorShare.shared.forwardActionKey(for: action)
+                note = "（カーソル共有で送信）"
+            } else {
+                note = "（相手のアプリのため送信なし）"
+            }
         } else if isFinder {
             postKey(for: action)
         } else if isRemote {
@@ -857,6 +863,7 @@ final class CursorShare {
         holding = false
         cameFrom = nil
         forwardTo = nil
+        remoteAppID = nil
         showCursor()
         stopPinning()
         EdgeGlow.shared.hide()
@@ -1110,6 +1117,35 @@ final class CursorShare {
         return Unmanaged.passUnretained(event)
     }
 
+    /// 起点が知っている「相手の最前面アプリ」(保持者からの app 報告。未報告なら nil)
+    private(set) var remoteAppID: String?
+
+    private var appObserver: NSObjectProtocol?
+
+    /// 保持者として、自分の最前面アプリを起点へ知らせる(共有中スワイプのアプリ別ゲート用)
+    private func reportFrontApp() {
+        guard holding, let to = cameFrom else { return }
+        if appObserver == nil {
+            appObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+                guard let self, self.holding, let dest = self.cameFrom,
+                      let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      let bid = app.bundleIdentifier else { return }
+                LinkNet.sendFast("app \(dest) \(bid)")
+            }
+        }
+        if let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier {
+            LinkNet.sendFast("app \(to) \(bid)")
+        }
+    }
+
+    /// 共有中のスワイプを相手へ送ってよいか(相手のアプリで判断する)
+    func swipeAllowedRemotely(_ action: SwipeAction) -> Bool {
+        guard let bid = remoteAppID else { return true }
+        if bid == "com.apple.finder" { return true }
+        if Self.browserIDs.contains(bid) { return action == .back || action == .forward }
+        return false
+    }
+
     /// 自分が起点で、カーソルが相手側にある状態か
     var sessionActiveAway: Bool { sending && awayTo != nil }
 
@@ -1298,6 +1334,7 @@ final class CursorShare {
             holding = true
             cameFrom = from
             sendAtSelf()
+            reportFrontApp()
             if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: entryRatio(forPeer: from, seg: seg)) }
             warp()
             status("カーソル共有： \(peerName(from)) から受け取りました")
@@ -1319,6 +1356,7 @@ final class CursorShare {
                 if let d = dir(ofPeer: from) { positionAtEdge(d, ratio: entryRatio(forPeer: from, seg: seg)); warp() }
                 status("カーソル共有： 戻ってきました")
                 sendAtSelf()
+                reportFrontApp()
             }
         case "assign":
             // レイアウトの割り当て: リンク表を丸ごと差し替える
@@ -1338,6 +1376,8 @@ final class CursorShare {
             status("レイアウト： 割り当てを受けました")
         case "at":
             if let holder = rest.first { cursorAtID = holder }
+        case "app":
+            if let bid = rest.first { remoteAppID = bid }
         case "mother":
             UserDefaults.standard.set(from, forKey: "mothershipID")
             status("母艦は \(peerName(from)) になりました")

@@ -8,7 +8,7 @@ A menu bar app for Mac that combines three tools into one.
 - **Cursor sharing**: Push the cursor past a screen edge and control passes to the neighboring machine. Works between Macs, and between Mac and Windows too (with the companion app in `windows/` on the Windows side). Machines learn their neighbors automatically, so the only setup is the layout on the Mac side.
 - **Always-visible cursor**: Draws a large cursor over the real one (handy when the real cursor disappears during remote control, such as in text fields). It hides itself automatically while the cursor is shared, so you never see two cursors.
 
-It also syncs work across machines: Mission Control / Task View sync opens the window overview on every machine at once, and Search sync (beta) opens ⌘+Space search on all machines at the same time. See the [manual](マニュアル.md) (in Japanese) for details.
+It also syncs work across machines: Mission Control / Task View sync opens the window overview on every machine at once, and Search sync (beta) opens ⌘+Space search on all machines at the same time. See the [manual](en/Manual.md) for details.
 
 ## Layout editor
 
@@ -22,7 +22,7 @@ Arrange machines on a canvas like the Displays settings pane. Just drag the tile
 
 *Note: merely opening the editor does not distribute anything. Move a tile (or change a color) and the current arrangement is sent to all machines. If you reinstall the app on one machine, nudge a tile once to redistribute.*
 
-For a quick start, see [つかいかた.md](つかいかた.md), and for the full manual, [マニュアル.md](マニュアル.md) (both in Japanese).
+For a quick start, see [en/HowToUse.md](en/HowToUse.md), and for the full manual, [en/Manual.md](en/Manual.md).
 
 ## Download
 

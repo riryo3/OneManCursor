@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-69"
+let buildTag = "Build 20261031-70"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -134,6 +134,7 @@ final class Engine {
     private var fired = false
     private var lastDx: Float = 0, lastDy: Float = 0   // 診断用: 最後に見た移動量
     private var horizLatch = false   // ブラウザ向け押し出し: 横意図を一度掴んだら保持する
+    private var prevCx: Float = 0, prevCy: Float = 0   // 瞬間の動きを見るための前フレーム重心
 
     // しきい値(正規化座標 0...1 に対する割合)
     private let flickMin: Float = 0.20     // 2本指フリックの最小移動量
@@ -158,6 +159,7 @@ final class Engine {
         if !session {
             guard n >= 2 else { return }
             CursorShare.shared.clearScrollSuppress()
+            prevCx = cx; prevCy = cy
             session = true; lockedCount = n; lockStableSince = timestamp
             startX = cx; startY = cy; startT = timestamp; fired = false
             return
@@ -173,9 +175,14 @@ final class Engine {
             // (Chrome のスワイプはフリックより遅く長いので、通常のフリック判定では拾えない)。
             // 指の動きそのもので判定するので、指を離した後の反動(惰性スクロール)は混ざらない
             if CursorShare.shared.sessionActiveAway, CursorShare.shared.remoteIsBrowser {
-                if abs(dx) >= 0.05, abs(dx) >= 1.5 * abs(dy) { horizLatch = true }
+                // 「横スワイプか」を先に判定する: 累積ではなく瞬間の動きで見る。
+                // 序盤の縦ズレに引きずられず、横の勢いが出た時点で横と確定させる
+                let vx = cx - prevCx, vy = cy - prevCy
+                prevCx = cx; prevCy = cy
+                if abs(vx) >= 0.005, abs(vx) >= 2 * abs(vy) { horizLatch = true }
+                if abs(vy) >= 0.005, abs(vy) >= 2 * abs(vx) { horizLatch = false }
                 if horizLatch { CursorShare.shared.engageScrollSuppress() }
-                if horizLatch, abs(dx) >= 0.15, abs(dx) >= 1.5 * abs(dy), elapsed <= 1.5 {
+                if horizLatch, abs(dx) >= 0.15, abs(dx) >= 1.2 * abs(dy), elapsed <= 1.5 {
                     fire(dx > 0 ? .back : .forward)
                     return
                 }
@@ -1193,10 +1200,21 @@ final class CursorShare {
         let now = Date().timeIntervalSince1970
         if now - scLastT > 0.25 { scAccX = 0; scAccY = 0; scLockH = nil }
         scLastT = now
-        scAccX += dx; scAccY += dy
-        if scLockH == nil, max(abs(scAccX), abs(scAccY)) >= 40 {
-            if abs(scAccX) >= 1.5 * abs(scAccY) { scLockH = true }
-            else if abs(scAccY) >= 1.5 * abs(scAccX) { scLockH = false }
+        // 直近の動きだけが残るよう減衰させながら積む(序盤の縦ズレが後半の横を邪魔しない)
+        scAccX = scAccX * 0.7 + dx; scAccY = scAccY * 0.7 + dy
+        let ax = abs(scAccX), ay = abs(scAccY)
+        if max(ax, ay) >= 30 {
+            // 横は優先して判定する(横への動きは、縦より明確な意思表示になりやすい)
+            let wantH: Bool? = ax >= 1.2 * ay ? true : (ay >= 1.8 * ax ? false : nil)
+            if let w = wantH {
+                if scLockH == nil { scLockH = w }
+                else if scLockH != w {
+                    // ロックと逆方向が圧倒的になったら乗り換える
+                    let cur = scLockH == true ? ax : ay
+                    let oth = scLockH == true ? ay : ax
+                    if oth >= 2.5 * cur { scLockH = w }
+                }
+            }
         }
         switch scLockH {
         case .some(true): return (0, dx)

@@ -51,6 +51,16 @@ to edit the ini by hand).
 - Push out past the edge of the Windows screen toward a neighboring machine and control moves to that machine
 - When Explorer is frontmost, swipe gestures (back/forward, etc.) work too
 
+■ Security prompts (UAC) and administrator apps
+- A normal-privilege app cannot send input to confirmation screens such as UAC (the secure
+  desktop) or to apps running as administrator. Left alone, the sender's cursor would vanish and
+  its keys would stop working, so when a prompt appears the cursor is handed back to the sender
+  automatically (while the prompt is shown, incoming cursors are also sent back. Operate the prompt
+  with this Windows machine's own mouse/keyboard; it returns to normal once the prompt closes)
+- To type into administrator apps (such as BCUninstaller), right-click the tray icon and check
+  "Run as administrator" (it then starts as administrator automatically from the next launch)
+  * Input into the prompt screen itself is impossible even as administrator, due to a Windows restriction
+
 ■ Notes
 - Communication has no authentication. This is a prototype for home LAN use only
 - Text being composed in an IME is not passed correctly (typing in Latin characters is recommended)

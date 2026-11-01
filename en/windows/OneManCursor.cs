@@ -11,12 +11,14 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -41,7 +43,7 @@ internal static class Program
     // Machine colors (ID -> "#RRGGBB"). Distributed by the Mac side's assignment (kept for future border display)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // Build number (for checking the version; bump it when features change)
-    private const string BuildTag = "Build 20261031-70";
+    private const string BuildTag = "Build 20261102-72";
 
     private static string SpecId(string spec)
     {
@@ -154,6 +156,8 @@ internal static class Program
     [DllImport("user32.dll")] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+    [DllImport("user32.dll")] private static extern bool CloseDesktop(IntPtr hDesktop);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct INPUT { public uint type; public INPUTUNION u; }
@@ -173,6 +177,7 @@ internal static class Program
 
     private const uint INPUT_KEYBOARD = 1;
     private const uint INPUT_MOUSE = 0;
+    private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const ushort VK_MENU = 0x12;
     private const ushort VK_LEFT = 0x25, VK_UP = 0x26, VK_RIGHT = 0x27, VK_RETURN = 0x0D;
@@ -188,12 +193,19 @@ internal static class Program
     private static int ScrH { get { return GetSystemMetrics(79); } }
 
     // ---- Input synthesis ----
+    // Send extended keys (arrows, Home/End, etc.) with the extended flag. Without it they are treated as
+    // numpad keys, and with Shift held Windows reports Shift as briefly released, so Shift+arrow stops working
+    private static bool IsExtendedKey(ushort vk)
+    {
+        return (vk >= 0x21 && vk <= 0x28) || vk == 0x2D || vk == 0x2E || vk == 0x5B || vk == 0x5C;
+    }
+
     private static INPUT MakeKey(ushort vk, bool keyUp)
     {
         INPUT i = new INPUT();
         i.type = INPUT_KEYBOARD;
         i.u.ki.wVk = vk;
-        i.u.ki.dwFlags = keyUp ? KEYEVENTF_KEYUP : 0;
+        i.u.ki.dwFlags = (keyUp ? KEYEVENTF_KEYUP : 0) | (IsExtendedKey(vk) ? KEYEVENTF_EXTENDEDKEY : 0);
         return i;
     }
 
@@ -374,6 +386,7 @@ internal static class Program
             sb.AppendLine("colors=" + (configKv.TryGetValue("colors", out v) ? v : ""));
             sb.AppendLine("push=" + (configKv.TryGetValue("push", out v) ? v : ""));
             sb.AppendLine("solo=" + (soloMode ? "1" : ""));
+            sb.AppendLine("admin=" + (configKv.TryGetValue("admin", out v) ? v : ""));
             File.WriteAllText(path, sb.ToString());
         }
         catch (Exception) { }
@@ -546,6 +559,84 @@ internal static class Program
     private static void ReleaseModifiers()
     {
         SendInputs(MakeKey(0x10, true), MakeKey(0x11, true), MakeKey(0x12, true), MakeKey(0x5B, true), MakeKey(0x5C, true));
+    }
+
+    // ---- Handling security prompts (UAC and other secure desktops) ----
+    // While a secure desktop or the lock screen is shown, a normal-privilege app cannot inject input.
+    // If we keep holding the cursor anyway, the sender's cursor stays hidden and its keys keep being swallowed
+    private static bool secureDesktop = false;
+
+    private static bool InputDesktopBlocked()
+    {
+        IntPtr d = OpenInputDesktop(0, false, 0x0100); // DESKTOP_SWITCHDESKTOP
+        if (d == IntPtr.Zero) return true;
+        CloseDesktop(d);
+        return false;
+    }
+
+    private static bool IsElevated()
+    {
+        try { return new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator); }
+        catch (Exception) { return false; }
+    }
+
+    /// Hand the cursor we hold back to its sender (does nothing if there is nowhere to return it)
+    private static void ReturnCursor(string reason)
+    {
+        if (!holding || cameFrom == null) return;
+        string back = cameFrom;
+        holding = false; cameFrom = null;
+        HideGlow();
+        SendFast("leave " + back + " 0.5");
+        Log("Cursor sharing: returned the cursor to " + PeerName(back) + " (" + reason + ")");
+    }
+
+    private static void WatchDesktop()
+    {
+        bool blocked = InputDesktopBlocked();
+        if (blocked == secureDesktop) return;
+        secureDesktop = blocked;
+        if (blocked)
+        {
+            Log("Security prompt detected: stopping input replay");
+            ReturnCursor("security prompt");
+        }
+        else
+        {
+            Log("Back to the normal desktop");
+            ReleaseModifiers(); // clean up modifier keys that could not be released during the prompt
+        }
+    }
+
+    /// Relaunch ourselves with normal / administrator privileges. Returns true if the new process started (the caller then exits)
+    private static bool Relaunch(bool elevated)
+    {
+        // Unless the single-instance Mutex is released first, the new process gets rejected
+        try { singleMutex.ReleaseMutex(); singleMutex.Close(); } catch { }
+        try
+        {
+            ProcessStartInfo psi;
+            if (elevated)
+            {
+                psi = new ProcessStartInfo(Application.ExecutablePath);
+                psi.Verb = "runas";
+            }
+            else
+            {
+                // Launch via Explorer so we start with normal privileges instead of inheriting administrator rights
+                psi = new ProcessStartInfo("explorer.exe", "\"" + Application.ExecutablePath + "\"");
+            }
+            psi.UseShellExecute = true;
+            Process.Start(psi);
+            return true;
+        }
+        catch (Exception)
+        {
+            // If the administrator prompt was cancelled, keep running as we are
+            bool created;
+            singleMutex = new Mutex(true, "OneManCursor.WindowsPeer", out created);
+            return false;
+        }
     }
 
     private static void HandleAssign(string[] args)
@@ -1005,11 +1096,11 @@ internal static class Program
             if (holding || forwardTo != null || args.Length < 1) return;
             double ratio;
             if (!double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ratio)) ratio = 0.5;
-            if (soloMode)
+            if (soloMode || secureDesktop)
             {
-                // Standalone mode: don't accept; send it straight back (the sender handles it as "came back to me")
+                // Standalone mode / while a security prompt is shown: don't accept; send it straight back (the sender handles it as "came back to me")
                 SendFast("leave " + from + " " + args[0]);
-                Log("Standalone mode: sent back the cursor from " + PeerName(from));
+                Log((soloMode ? "Standalone mode" : "Security prompt") + ": sent back the cursor from " + PeerName(from));
                 return;
             }
             holding = true;
@@ -1202,6 +1293,18 @@ internal static class Program
                 SaveConfig();
             };
             menu.Items.Add(soloItem);
+            ToolStripMenuItem adminItem = new ToolStripMenuItem("Run as administrator (can also type into admin apps)");
+            adminItem.Checked = IsElevated();
+            adminItem.Click += delegate
+            {
+                bool want = !IsElevated();
+                configKv["admin"] = want ? "1" : "";
+                SaveConfig();
+                if (Relaunch(want)) { icon.Visible = false; Environment.Exit(0); }
+                configKv["admin"] = IsElevated() ? "1" : "";
+                SaveConfig();
+            };
+            menu.Items.Add(adminItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Restart", null, delegate
             {
@@ -1219,6 +1322,11 @@ internal static class Program
             icon.ContextMenuStrip = menu;
             icon.Visible = true;
             icon.DoubleClick += delegate { ShowLogWindow(); };
+            // Watch for security prompts appearing and going away
+            System.Windows.Forms.Timer watch = new System.Windows.Forms.Timer();
+            watch.Interval = 250;
+            watch.Tick += delegate { try { WatchDesktop(); } catch (Exception) { } };
+            watch.Start();
         }
 
         private void Exit()
@@ -1240,6 +1348,8 @@ internal static class Program
             return;
         }
         LoadConfig();
+        string adm;
+        if (configKv.TryGetValue("admin", out adm) && adm == "1" && !IsElevated() && Relaunch(true)) return;
         sender = new UdpClient();
         sender.EnableBroadcast = true;
 

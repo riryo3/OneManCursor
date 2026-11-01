@@ -16,7 +16,9 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Drawing;
+using System.Diagnostics;
 using System.Drawing.Imaging;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -41,7 +43,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261031-70";
+    private const string BuildTag = "Build 20261102-72";
 
     private static string SpecId(string spec)
     {
@@ -154,6 +156,8 @@ internal static class Program
     [DllImport("user32.dll")] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+    [DllImport("user32.dll")] private static extern bool CloseDesktop(IntPtr hDesktop);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct INPUT { public uint type; public INPUTUNION u; }
@@ -173,6 +177,7 @@ internal static class Program
 
     private const uint INPUT_KEYBOARD = 1;
     private const uint INPUT_MOUSE = 0;
+    private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const ushort VK_MENU = 0x12;
     private const ushort VK_LEFT = 0x25, VK_UP = 0x26, VK_RIGHT = 0x27, VK_RETURN = 0x0D;
@@ -188,12 +193,19 @@ internal static class Program
     private static int ScrH { get { return GetSystemMetrics(79); } }
 
     // ---- 入力の合成 ----
+    // 拡張キー(カーソルキー・Home/End など)は拡張の印を付けて送る。付けないとテンキー扱いになり、
+    // Shift を押したままだと Windows が Shift を一瞬外した扱いにして、Shift+矢印が効かなくなる
+    private static bool IsExtendedKey(ushort vk)
+    {
+        return (vk >= 0x21 && vk <= 0x28) || vk == 0x2D || vk == 0x2E || vk == 0x5B || vk == 0x5C;
+    }
+
     private static INPUT MakeKey(ushort vk, bool keyUp)
     {
         INPUT i = new INPUT();
         i.type = INPUT_KEYBOARD;
         i.u.ki.wVk = vk;
-        i.u.ki.dwFlags = keyUp ? KEYEVENTF_KEYUP : 0;
+        i.u.ki.dwFlags = (keyUp ? KEYEVENTF_KEYUP : 0) | (IsExtendedKey(vk) ? KEYEVENTF_EXTENDEDKEY : 0);
         return i;
     }
 
@@ -374,6 +386,7 @@ internal static class Program
             sb.AppendLine("colors=" + (configKv.TryGetValue("colors", out v) ? v : ""));
             sb.AppendLine("push=" + (configKv.TryGetValue("push", out v) ? v : ""));
             sb.AppendLine("solo=" + (soloMode ? "1" : ""));
+            sb.AppendLine("admin=" + (configKv.TryGetValue("admin", out v) ? v : ""));
             File.WriteAllText(path, sb.ToString());
         }
         catch (Exception) { }
@@ -546,6 +559,84 @@ internal static class Program
     private static void ReleaseModifiers()
     {
         SendInputs(MakeKey(0x10, true), MakeKey(0x11, true), MakeKey(0x12, true), MakeKey(0x5B, true), MakeKey(0x5C, true));
+    }
+
+    // ---- セキュリティ確認画面(UAC 等のセキュアデスクトップ)への対処 ----
+    // セキュアデスクトップやロック画面が出ている間、通常権限のアプリは入力を注入できない。
+    // 注入できないのに保持したままだと、送り手側ではカーソルが消えてキーも飲まれたままになる
+    private static bool secureDesktop = false;
+
+    private static bool InputDesktopBlocked()
+    {
+        IntPtr d = OpenInputDesktop(0, false, 0x0100); // DESKTOP_SWITCHDESKTOP
+        if (d == IntPtr.Zero) return true;
+        CloseDesktop(d);
+        return false;
+    }
+
+    private static bool IsElevated()
+    {
+        try { return new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator); }
+        catch (Exception) { return false; }
+    }
+
+    /// 受け取っているカーソルを送り手に返す(戻す先が無ければ何もしない)
+    private static void ReturnCursor(string reason)
+    {
+        if (!holding || cameFrom == null) return;
+        string back = cameFrom;
+        holding = false; cameFrom = null;
+        HideGlow();
+        SendFast("leave " + back + " 0.5");
+        Log("カーソル共有: " + reason + "のため、" + PeerName(back) + " へカーソルを返しました");
+    }
+
+    private static void WatchDesktop()
+    {
+        bool blocked = InputDesktopBlocked();
+        if (blocked == secureDesktop) return;
+        secureDesktop = blocked;
+        if (blocked)
+        {
+            Log("セキュリティ確認画面を検出: 入力の再現を止めます");
+            ReturnCursor("セキュリティ確認画面");
+        }
+        else
+        {
+            Log("通常の画面に戻りました");
+            ReleaseModifiers(); // 確認画面の間に離せなかった修飾キーの掃除
+        }
+    }
+
+    /// 通常権限 / 管理者権限で自分自身を起動し直す。起動できたら true(呼び出し側が終了する)
+    private static bool Relaunch(bool elevated)
+    {
+        // 二重起動防止の Mutex を先に手放さないと、新しいプロセスが弾かれる
+        try { singleMutex.ReleaseMutex(); singleMutex.Close(); } catch { }
+        try
+        {
+            ProcessStartInfo psi;
+            if (elevated)
+            {
+                psi = new ProcessStartInfo(Application.ExecutablePath);
+                psi.Verb = "runas";
+            }
+            else
+            {
+                // 管理者権限を引き継がないよう、エクスプローラー経由で通常権限として起動する
+                psi = new ProcessStartInfo("explorer.exe", "\"" + Application.ExecutablePath + "\"");
+            }
+            psi.UseShellExecute = true;
+            Process.Start(psi);
+            return true;
+        }
+        catch (Exception)
+        {
+            // 管理者の確認を取り消したときなどは、このまま動かし続ける
+            bool created;
+            singleMutex = new Mutex(true, "OneManCursor.WindowsPeer", out created);
+            return false;
+        }
     }
 
     private static void HandleAssign(string[] args)
@@ -1005,11 +1096,11 @@ internal static class Program
             if (holding || forwardTo != null || args.Length < 1) return;
             double ratio;
             if (!double.TryParse(args[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out ratio)) ratio = 0.5;
-            if (soloMode)
+            if (soloMode || secureDesktop)
             {
-                // 単独モード: 受け取らず、そのまま送り返す(送り手は「手元に戻ってきた」として処理する)
+                // 単独モード / セキュリティ確認画面の間: 受け取らず、そのまま送り返す(送り手は「手元に戻ってきた」として処理する)
                 SendFast("leave " + from + " " + args[0]);
-                Log("単独モード: " + PeerName(from) + " からのカーソルを返送しました");
+                Log((soloMode ? "単独モード" : "セキュリティ確認画面") + ": " + PeerName(from) + " からのカーソルを返送しました");
                 return;
             }
             holding = true;
@@ -1202,6 +1293,18 @@ internal static class Program
                 SaveConfig();
             };
             menu.Items.Add(soloItem);
+            ToolStripMenuItem adminItem = new ToolStripMenuItem("管理者権限で実行 (管理者のアプリにも入力できる)");
+            adminItem.Checked = IsElevated();
+            adminItem.Click += delegate
+            {
+                bool want = !IsElevated();
+                configKv["admin"] = want ? "1" : "";
+                SaveConfig();
+                if (Relaunch(want)) { icon.Visible = false; Environment.Exit(0); }
+                configKv["admin"] = IsElevated() ? "1" : "";
+                SaveConfig();
+            };
+            menu.Items.Add(adminItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("再起動", null, delegate
             {
@@ -1219,6 +1322,11 @@ internal static class Program
             icon.ContextMenuStrip = menu;
             icon.Visible = true;
             icon.DoubleClick += delegate { ShowLogWindow(); };
+            // セキュリティ確認画面の出入りを見張る
+            System.Windows.Forms.Timer watch = new System.Windows.Forms.Timer();
+            watch.Interval = 250;
+            watch.Tick += delegate { try { WatchDesktop(); } catch (Exception) { } };
+            watch.Start();
         }
 
         private void Exit()
@@ -1240,6 +1348,8 @@ internal static class Program
             return;
         }
         LoadConfig();
+        string adm;
+        if (configKv.TryGetValue("admin", out adm) && adm == "1" && !IsElevated() && Relaunch(true)) return;
         sender = new UdpClient();
         sender.EnableBroadcast = true;
 

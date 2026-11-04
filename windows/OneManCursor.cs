@@ -46,7 +46,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261102-74";
+    private const string BuildTag = "Build 20261103-75";
 
     private static string SpecId(string spec)
     {
@@ -390,6 +390,9 @@ internal static class Program
             sb.AppendLine("push=" + (configKv.TryGetValue("push", out v) ? v : ""));
             sb.AppendLine("solo=" + (soloMode ? "1" : ""));
             sb.AppendLine("admin=" + (configKv.TryGetValue("admin", out v) ? v : ""));
+            sb.AppendLine("updatecheck=" + (configKv.TryGetValue("updatecheck", out v) ? v : ""));
+            sb.AppendLine("paircodes=" + (configKv.TryGetValue("paircodes", out v) ? v : ""));
+            sb.AppendLine("pairlastts=" + (configKv.TryGetValue("pairlastts", out v) ? v : ""));
             File.WriteAllText(path, sb.ToString());
         }
         catch (Exception) { }
@@ -454,6 +457,7 @@ internal static class Program
         if (next == cameFrom)
         {
             SendFast("leave " + next + " " + segText);
+            ReleaseHeldInput("カーソルを返した");
             holding = false;
             cameFrom = null;
             Log("カーソル共有: 手元に返しました");
@@ -461,6 +465,7 @@ internal static class Program
         else
         {
             SendFast("enter " + next + " " + segText + " " + dir);
+            ReleaseHeldInput("カーソルを先へ渡した");
             forwardTo = next;
             holding = false;
             Log("カーソル共有: " + PeerName(next) + " へ渡しました");
@@ -468,8 +473,177 @@ internal static class Program
         return true;
     }
 
+    // ---- 押されたままの入力の掃除 ----
+    // 起点との通信が途切れたり、セッションが終わったりしたときに、注入したキー・修飾キー・
+    // マウスボタンの離し忘れが残らないよう、押している間は記録しておく
+    private static readonly object heldLock = new object();
+    private static readonly HashSet<int> heldModCodes = new HashSet<int>();
+    private static readonly HashSet<ushort> heldKeyVks = new HashSet<ushort>();
+    private static readonly HashSet<int> heldButtons = new HashSet<int>();
+    private static DateTime lastRemoteInput = DateTime.UtcNow;
+    // 起点から何も届かないまま、キーが押されたままこの秒数を超えたら離す
+    private const double HeldTimeoutSec = 6;
+
+    private static long ModBit(int code)
+    {
+        return code == 56 || code == 60 ? 0x20000L
+             : code == 59 || code == 62 ? 0x40000L
+             : code == 58 || code == 61 ? 0x80000L
+             : code == 55 || code == 54 ? 0x100000L : 0L;
+    }
+
+    private static void ReleaseModCodes(List<int> codes, string reason)
+    {
+        foreach (int c in codes)
+        {
+            ushort vk;
+            if (MacKeyToVK.TryGetValue(c, out vk)) SendInputs(MakeKey(vk, true));
+        }
+        lock (heldLock) { foreach (int c in codes) heldModCodes.Remove(c); }
+        Log("押されたままの修飾キーを離しました(" + reason + ")");
+    }
+
+    /// 届いたキー操作を記録する。起点の最新の修飾状態(flags)にもう無い修飾キーは離す
+    /// (「離す」の合図が落ちても、次のキー操作で自然に直る)
+    private static void TrackHeld(string kind, int code, long flags, ushort vk)
+    {
+        List<int> stale = new List<int>();
+        lock (heldLock)
+        {
+            foreach (int c in heldModCodes)
+                if ((ModBit(c) & flags) == 0 && !(kind == "fl" && c == code)) stale.Add(c);
+        }
+        if (stale.Count > 0) ReleaseModCodes(stale, "起点の修飾状態と食い違い");
+        lock (heldLock)
+        {
+            if (kind == "fl")
+            {
+                long bit = ModBit(code);
+                if (bit != 0) { if ((flags & bit) != 0) heldModCodes.Add(code); else heldModCodes.Remove(code); }
+            }
+        }
+    }
+
+    /// 押されたままの入力(キー・修飾キー・マウスボタン)をすべて離す
+    private static void ReleaseHeldInput(string reason)
+    {
+        List<int> mods; List<ushort> keys; List<int> buttons;
+        lock (heldLock)
+        {
+            mods = new List<int>(heldModCodes);
+            keys = new List<ushort>(heldKeyVks);
+            buttons = new List<int>(heldButtons);
+            heldModCodes.Clear(); heldKeyVks.Clear(); heldButtons.Clear();
+        }
+        if (mods.Count == 0 && keys.Count == 0 && buttons.Count == 0) return;
+        foreach (ushort k in keys) SendInputs(MakeKey(k, true));
+        if (mods.Count > 0) ReleaseModifiers();
+        foreach (int b in buttons)
+        {
+            uint f = b == 1 ? MOUSEEVENTF_RIGHTUP : b == 2 ? MOUSEEVENTF_MIDDLEUP : MOUSEEVENTF_LEFTUP;
+            SendInputs(MakeMouse(f, 0));
+        }
+        Log("押されたままの入力を離しました(" + reason + "): キー" + keys.Count + " 修飾" + mods.Count + " ボタン" + buttons.Count);
+    }
+
+    /// 一定時間、起点から入力が来ないまま押されたままのものがあれば離す(UI タイマーから呼ぶ)
+    private static void CheckHeldTimeout()
+    {
+        bool any;
+        lock (heldLock) { any = heldModCodes.Count > 0 || heldKeyVks.Count > 0; }
+        if (!any) return;
+        if (!holding) ReleaseHeldInput("セッション外");
+        else if ((DateTime.UtcNow - lastRemoteInput).TotalSeconds > HeldTimeoutSec) ReleaseHeldInput("起点から" + (int)HeldTimeoutSec + "秒以上入力が無い");
+    }
+
+    // ---- ペアリングとリモート再起動 ----
+    // 親(Mac)が発行したコードを子に入力しておくと、親から子のアプリを再起動できる。
+    // コードは通信に流さない。再起動の合図に、コードを鍵にした署名(HMAC-SHA256)が付く。
+    // 署名が合わない・時刻が古い・使い回された合図は無視する(Mac 側と同じ仕様)
+    private const string PairAlphabet = "23456789ABCDEFGHJKMNPQRSTVWXYZ";
+    private const int PairCodeLength = 10;
+    private const int PairTolerance = 90;
+    private static Action restartAction;
+
+    private static string PairNormalize(string input)
+    {
+        StringBuilder sb = new StringBuilder();
+        foreach (char ch in input.ToUpperInvariant())
+        {
+            if (ch == '-' || char.IsWhiteSpace(ch)) continue;
+            if (PairAlphabet.IndexOf(ch) < 0) return null;
+            sb.Append(ch);
+        }
+        return sb.Length == PairCodeLength ? sb.ToString() : null;
+    }
+
+    private static List<string> PairCodes()
+    {
+        string v;
+        List<string> l = new List<string>();
+        if (configKv.TryGetValue("paircodes", out v))
+            foreach (string c in v.Split(';')) if (c.Length > 0) l.Add(c);
+        return l;
+    }
+
+    private static void PairAdd(string code)
+    {
+        List<string> l = PairCodes();
+        if (!l.Contains(code)) l.Add(code);
+        if (l.Count > 8) l.RemoveRange(0, l.Count - 8);
+        configKv["paircodes"] = string.Join(";", l.ToArray());
+        SaveConfig();
+    }
+
+    private static void PairClear()
+    {
+        configKv["paircodes"] = "";
+        SaveConfig();
+    }
+
+    private static string PairSign(string code, string from, string target, long ts)
+    {
+        string msg = "restart|" + from + "|" + target + "|" + ts;
+        using (HMACSHA256 h = new HMACSHA256(Encoding.UTF8.GetBytes(code)))
+        {
+            StringBuilder sb = new StringBuilder();
+            foreach (byte b in h.ComputeHash(Encoding.UTF8.GetBytes(msg))) sb.Append(b.ToString("x2"));
+            return sb.ToString();
+        }
+    }
+
+    /// 受けた再起動の合図を確かめる。問題があれば理由を返す(null = 受け付ける)
+    private static string PairVerify(string from, string target, long ts, string sig)
+    {
+        List<string> codes = PairCodes();
+        if (codes.Count == 0) return "この端末はペアリングされていません";
+        long now = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+        if (Math.Abs(now - ts) > PairTolerance) return "時刻が " + PairTolerance + " 秒以上ずれています(親と子の時計を確認してください)";
+        bool ok = false;
+        foreach (string c in codes) if (PairSign(c, from, target, ts) == sig) { ok = true; break; }
+        if (!ok) return "署名が合いません(コードが違う可能性があります)";
+        string last;
+        long lastTs;
+        if (configKv.TryGetValue("pairlastts", out last) && long.TryParse(last, out lastTs) && ts <= lastTs) return "古い合図です";
+        configKv["pairlastts"] = ts.ToString();
+        SaveConfig();
+        return null;
+    }
+
+    private static void HandleRestart(string[] rest, string from)
+    {
+        // rest: 宛先ID ts 署名
+        long ts;
+        if (rest.Length < 3 || rest[0] != myId || !long.TryParse(rest[1], out ts)) return;
+        string why = PairVerify(from, myId, ts, rest[2]);
+        if (why != null) { Log("リモート再起動を拒否: " + why); return; }
+        Log("リモート再起動: " + PeerName(from) + " の指示で再起動します");
+        if (uiCtx != null && restartAction != null) uiCtx.Post(delegate { restartAction(); }, null);
+    }
+
     private static void ApplyCursor(string kind, string[] args)
     {
+        lastRemoteInput = DateTime.UtcNow;
         if (kind == "mv")
         {
             double dx, dy;
@@ -512,6 +686,7 @@ internal static class Program
                    : b == 2 ? (down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP)
                    : (down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP);
             SendInputs(MakeMouse(f, 0));
+            lock (heldLock) { if (down) heldButtons.Add(b); else heldButtons.Remove(b); }
         }
         else if (kind == "sc")
         {
@@ -542,7 +717,12 @@ internal static class Program
                 return;
             }
             ushort vk;
-            if (MacKeyToVK.TryGetValue(code, out vk)) SendInputs(MakeKey(vk, kind == "ku"));
+            TrackHeld(kind, code, flags, 0);
+            if (MacKeyToVK.TryGetValue(code, out vk))
+            {
+                SendInputs(MakeKey(vk, kind == "ku"));
+                lock (heldLock) { if (kind == "kd") heldKeyVks.Add(vk); else heldKeyVks.Remove(vk); }
+            }
         }
         else if (kind == "fl")
         {
@@ -553,6 +733,7 @@ internal static class Program
                      : code == 58 || code == 61 ? 0x80000L
                      : code == 55 || code == 54 ? 0x100000L : 0L;
             ushort vk;
+            TrackHeld("fl", code, flags, 0);
             if (bit != 0 && MacKeyToVK.TryGetValue(code, out vk))
                 SendInputs(MakeKey(vk, (flags & bit) == 0));
         }
@@ -588,6 +769,7 @@ internal static class Program
     {
         if (!holding || cameFrom == null) return;
         string back = cameFrom;
+        ReleaseHeldInput(reason);
         holding = false; cameFrom = null;
         HideGlow();
         SendFast("leave " + back + " 0.5");
@@ -1016,6 +1198,7 @@ internal static class Program
 
     private static void ReceiveCursor(string kind, string[] rest, string from)
     {
+        if (kind == "restart") { HandleRestart(rest, from); return; }
         // rest[0] は宛先ID
         if (rest.Length < 1 || rest[0] != myId) return;
         string[] args = new string[rest.Length - 1];
@@ -1430,12 +1613,48 @@ internal static class Program
         }
     }
 
+    /// ペアリングコードの入力ダイアログ。OK で入力された文字列、キャンセルで null
+    private static string PromptPairCode()
+    {
+        using (Form f = new Form())
+        {
+            f.Text = "ペアリングコードを入力";
+            f.FormBorderStyle = FormBorderStyle.FixedDialog;
+            f.StartPosition = FormStartPosition.CenterScreen;
+            f.MaximizeBox = false; f.MinimizeBox = false; f.ShowInTaskbar = true;
+            f.ClientSize = new Size(380, 120);
+            Label l = new Label();
+            l.Text = "親の Mac に表示されたコード(例: ABCDE-FGHJK)を入力してください。";
+            l.SetBounds(12, 12, 356, 36);
+            TextBox t = new TextBox();
+            t.SetBounds(12, 52, 356, 24);
+            Button ok = new Button();
+            ok.Text = "ペアリング"; ok.DialogResult = DialogResult.OK;
+            ok.SetBounds(188, 86, 88, 26);
+            Button cancel = new Button();
+            cancel.Text = "キャンセル"; cancel.DialogResult = DialogResult.Cancel;
+            cancel.SetBounds(282, 86, 88, 26);
+            f.Controls.Add(l); f.Controls.Add(t); f.Controls.Add(ok); f.Controls.Add(cancel);
+            f.AcceptButton = ok; f.CancelButton = cancel;
+            f.TopMost = true;
+            return f.ShowDialog() == DialogResult.OK ? t.Text : null;
+        }
+    }
+
     private sealed class TrayContext : ApplicationContext
     {
         private readonly NotifyIcon icon;
         private readonly ToolStripMenuItem cursorItem;
         private ToolStripMenuItem updateItem;
         private ToolStripMenuItem updateAutoItem;
+
+        /// 二重起動防止の Mutex を先に手放してから、自分を起動し直す
+        private void RestartSelf()
+        {
+            try { singleMutex.ReleaseMutex(); singleMutex.Close(); } catch { }
+            icon.Visible = false;
+            Application.Restart();
+        }
 
         private void RefreshUpdateItem()
         {
@@ -1520,6 +1739,7 @@ internal static class Program
                 if (soloMode && holding && cameFrom != null)
                 {
                     SendFast("leave " + cameFrom + " 0.5");
+                    ReleaseHeldInput("単独モード");
                     holding = false; cameFrom = null;
                     Log("単独モード: カーソルを返しました");
                 }
@@ -1556,13 +1776,30 @@ internal static class Program
             };
             menu.Items.Add(updateAutoItem);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("再起動", null, delegate
+            ToolStripMenuItem pairParent = new ToolStripMenuItem("ペアリング（リモート再起動）");
+            pairParent.DropDownItems.Add("ペアリングコードを入力…", null, delegate
             {
-                // 二重起動防止の Mutex を先に手放さないと、新しいプロセスが弾かれる
-                try { singleMutex.ReleaseMutex(); singleMutex.Close(); } catch { }
-                icon.Visible = false;
-                Application.Restart();
+                string input = PromptPairCode();
+                if (input == null) return;
+                string code = PairNormalize(input);
+                if (code == null)
+                {
+                    MessageBox.Show("10文字のコード(例: ABCDE-FGHJK)を入力してください。", "コードが正しくありません");
+                    return;
+                }
+                PairAdd(code);
+                Log("ペアリングしました");
+                MessageBox.Show("この端末は、コードを発行した Mac から再起動できるようになりました。", "ペアリングしました");
             });
+            pairParent.DropDownItems.Add("ペアリングを解除", null, delegate
+            {
+                PairClear();
+                Log("ペアリングを解除しました");
+                MessageBox.Show("この端末は、リモート再起動を受け付けません。", "ペアリングを解除しました");
+            });
+            menu.Items.Add(pairParent);
+            restartAction = delegate { RestartSelf(); };
+            menu.Items.Add("再起動", null, delegate { RestartSelf(); });
             menu.Items.Add("終了", null, delegate { Exit(); });
             InstallSwitchHooks();
             uiCtx = System.Threading.SynchronizationContext.Current;
@@ -1577,6 +1814,11 @@ internal static class Program
             watch.Interval = 250;
             watch.Tick += delegate { try { WatchDesktop(); } catch (Exception) { } };
             watch.Start();
+            // 押されたままの入力の掃除(起点から入力が途絶えたとき)
+            System.Windows.Forms.Timer heldTimer = new System.Windows.Forms.Timer();
+            heldTimer.Interval = 2000;
+            heldTimer.Tick += delegate { try { CheckHeldTimeout(); } catch (Exception) { } };
+            heldTimer.Start();
             // 更新の確認: 起動の少しあとに1回、その後は1日1回
             System.Windows.Forms.Timer updTimer = new System.Windows.Forms.Timer();
             updTimer.Interval = 15000;
@@ -1676,6 +1918,7 @@ internal static class Program
             if (kind == "reset")
             {
                 bool wasInSession = holding || forwardTo != null;
+                ReleaseHeldInput("リセット");
                 holding = false; cameFrom = null; forwardTo = null;
                 HideGlow();
                 if (wasInSession)

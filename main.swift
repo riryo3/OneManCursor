@@ -12,7 +12,7 @@ import CryptoKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261102-74"
+let buildTag = "Build 20261103-75"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -785,6 +785,7 @@ final class CursorShare {
     func enforceSolo() {
         if holding, let from = cameFrom {
             LinkNet.sendFast("leave \(from) 0.5")
+            releaseHeldInput(reason: "単独モード")
             holding = false
             cameFrom = nil
             EdgeGlow.shared.hide()
@@ -804,6 +805,117 @@ final class CursorShare {
     }
     private var edgePush: [PartnerDir: Double] = [:]   // 起点側: 端への押し込み累積
     private var holdPush: [PartnerDir: Double] = [:]   // 保持側: 端への押し込み累積
+
+    // 保持側で「押されたまま」になりうる入力(キー・修飾キー)の記録。
+    // 起点との通信が途切れたり、セッションが終わったりしたときに、離し忘れを掃除するため。
+    // receive は複数のスレッドから呼ばれるので、ロックを通して触る
+    private let heldLock = NSLock()
+    private var heldModCodes = Set<UInt16>()
+    private var heldKeyCodes = Set<UInt16>()
+    private var lastRemoteInput = Date()
+    private var heldWatchdog: Timer?
+    /// 起点から何も届かないまま、キーが押されたままこの秒数を超えたら離す
+    private static let heldTimeout: TimeInterval = 6
+
+    private static func modBit(for code: UInt16) -> UInt64 {
+        switch code {
+        case 56, 60: return 0x20000    // shift
+        case 59, 62: return 0x40000    // control
+        case 58, 61: return 0x80000    // option
+        case 55, 54: return 0x100000   // command
+        case 63: return 0x800000       // fn
+        default: return 0
+        }
+    }
+
+    /// 届いたキー操作を記録する。あわせて、起点の最新の修飾状態(flags)にもう無い修飾キーは離す
+    /// (「離す」の合図が落ちても、次のキー操作で自然に直る)
+    private func trackHeld(kind: String, code: UInt16, flags: UInt64) {
+        heldLock.lock()
+        let stale = heldModCodes.filter { Self.modBit(for: $0) & flags == 0 && !(kind == "fl" && $0 == code) }
+        heldLock.unlock()
+        if !stale.isEmpty { releaseMods(stale, remaining: flags, reason: "起点の修飾状態と食い違い") }
+        heldLock.lock()
+        switch kind {
+        case "fl":
+            let bit = Self.modBit(for: code)
+            if bit != 0 { if flags & bit != 0 { heldModCodes.insert(code) } else { heldModCodes.remove(code) } }
+        case "kd": heldKeyCodes.insert(code)
+        case "ku": heldKeyCodes.remove(code)
+        default: break
+        }
+        let any = !heldModCodes.isEmpty || !heldKeyCodes.isEmpty
+        heldLock.unlock()
+        if any { startHeldWatchdog() }
+    }
+
+    private func releaseMods(_ codes: Set<UInt16>, remaining: UInt64, reason: String) {
+        var flags = remaining
+        for c in codes {
+            flags &= ~Self.modBit(for: c)
+            if let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(c), keyDown: false) {
+                e.type = .flagsChanged
+                e.flags = CGEventFlags(rawValue: flags)
+                e.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
+                e.post(tap: .cghidEventTap)
+            }
+        }
+        heldLock.lock(); heldModCodes.subtract(codes); heldLock.unlock()
+        NetLog.shared.log("押されたままの修飾キーを離しました(\(reason)): \(codes.sorted())")
+    }
+
+    /// 押されたままの入力(キー・修飾キー・マウスボタン)をすべて離す
+    func releaseHeldInput(reason: String) {
+        heldLock.lock()
+        let mods = heldModCodes
+        let keys = heldKeyCodes
+        heldKeyCodes.removeAll()
+        heldLock.unlock()
+        for c in keys {
+            if let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(c), keyDown: false) {
+                e.flags = []
+                e.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
+                e.post(tap: .cghidEventTap)
+            }
+        }
+        if !mods.isEmpty { releaseMods(mods, remaining: 0, reason: reason) }
+        let buttons = downButtons
+        downButtons.removeAll()
+        for b in buttons { postMouse(down: false, button: b) }
+        if !keys.isEmpty || !buttons.isEmpty {
+            NetLog.shared.log("押されたままの入力を離しました(\(reason)): キー\(keys.sorted()) ボタン\(buttons.sorted())")
+        }
+    }
+
+    private func startHeldWatchdog() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.heldWatchdog == nil else { return }
+            let t = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.heldLock.lock()
+                let empty = self.heldModCodes.isEmpty && self.heldKeyCodes.isEmpty
+                self.heldLock.unlock()
+                if empty { self.heldWatchdog?.invalidate(); self.heldWatchdog = nil; return }
+                if !self.holding || Date().timeIntervalSince(self.lastRemoteInput) > Self.heldTimeout {
+                    self.releaseHeldInput(reason: self.holding ? "起点から\(Int(Self.heldTimeout))秒以上入力が無い" : "セッション外")
+                }
+            }
+            RunLoop.main.add(t, forMode: .common)
+            self.heldWatchdog = t
+        }
+    }
+
+    /// 再起動の合図を受けたときの処理(ペアリング済みで署名が正しいときだけ再起動する)
+    private func handleRestart(_ args: [String], from: String) {
+        guard args.count >= 3, args[0] == LinkNet.machineID, let ts = Int(args[1]) else { return }
+        if let why = Pairing.verifyRestart(from: from, target: LinkNet.machineID, ts: ts, sig: args[2]) {
+            NetLog.shared.log("リモート再起動を拒否: \(why)")
+            status("リモート再起動を拒否: \(why)")
+            return
+        }
+        NetLog.shared.log("リモート再起動: \(peerName(from)) の指示で再起動します")
+        DispatchQueue.main.async { (NSApp.delegate as? App)?.relaunchSelf() }
+    }
     private var multAccX = 0.0, multAccY = 0.0         // 倍率の端数を持ち越す
 
     private init() {
@@ -908,6 +1020,7 @@ final class CursorShare {
     }
 
     func resetSession() {
+        if holding || forwardTo != nil { releaseHeldInput(reason: "セッション終了") }
         sending = false
         awayTo = nil
         holding = false
@@ -1404,6 +1517,7 @@ final class CursorShare {
     // MARK: 受け側(LinkNet から呼ばれる。args の先頭は宛先ID)
 
     func receive(_ kind: String, args: [String], from: String) {
+        if kind == "restart" { handleRestart(args, from: from); return }
         guard enabled, let to = args.first, to == LinkNet.machineID else { return }
         let rest = Array(args.dropFirst())
         switch kind {
@@ -1562,11 +1676,13 @@ final class CursorShare {
         let next = lk.id
         if next == cameFrom {
             LinkNet.sendFast("leave \(next) \(seg)")
+            releaseHeldInput(reason: "カーソルを返した")
             holding = false
             cameFrom = nil
             status("カーソル共有： 手元に返しました")
         } else {
             LinkNet.sendFast("enter \(next) \(seg) \(dir.rawValue)")
+            releaseHeldInput(reason: "カーソルを先へ渡した")
             forwardTo = next
             holding = false
             status("カーソル共有： \(peerName(next)) へ渡しました")
@@ -1576,6 +1692,7 @@ final class CursorShare {
     }
 
     private func apply(_ kind: String, args: [String]) {
+        lastRemoteInput = Date()
         let b = allBounds
         switch kind {
         case "mv":
@@ -1633,6 +1750,7 @@ final class CursorShare {
             if kind == "fl" || code == 126 || code == 99 {
                 NetLog.shared.log("キー適用: \(kind) code=\(code) flags=\(flagsRaw)")
             }
+            trackHeld(kind: kind, code: code, flags: flagsRaw)
             if let e = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: kind != "ku") {
                 e.flags = CGEventFlags(rawValue: flagsRaw)
                 if kind == "fl" { e.type = .flagsChanged }
@@ -3320,6 +3438,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var loginItem: NSMenuItem!
     var updateItem: NSMenuItem!
     var updateAutoItem: NSMenuItem!
+    var restartPeersItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
         migrateDefaultsIfNeeded()
@@ -3426,6 +3545,19 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateAutoItem.target = self
         updateAutoItem.state = Updater.shared.autoCheck ? .on : .off
         menu.addItem(updateItem); menu.addItem(updateCheckItem); menu.addItem(updateAutoItem); menu.addItem(.separator())
+        let pairParent = NSMenuItem(title: "ペアリング（リモート再起動）", action: nil, keyEquivalent: "")
+        let pairMenu = NSMenu()
+        let pairShow = NSMenuItem(title: "ペアリングコードを表示（親にする）…", action: #selector(showPairCode), keyEquivalent: "")
+        pairShow.target = self
+        let pairEnter = NSMenuItem(title: "ペアリングコードを入力（子にする）…", action: #selector(enterPairCode), keyEquivalent: "")
+        pairEnter.target = self
+        let pairClear = NSMenuItem(title: "ペアリングを解除（子）", action: #selector(clearPairCodes), keyEquivalent: "")
+        pairClear.target = self
+        pairMenu.addItem(pairShow); pairMenu.addItem(pairEnter); pairMenu.addItem(pairClear)
+        pairParent.submenu = pairMenu
+        restartPeersItem = NSMenuItem(title: "他の端末を再起動", action: nil, keyEquivalent: "")
+        restartPeersItem.submenu = NSMenu()
+        menu.addItem(pairParent); menu.addItem(restartPeersItem); menu.addItem(.separator())
         Updater.shared.onChange = { [weak self] in self?.refreshUpdateItem() }
         menu.delegate = self
         let relaunchItem = NSMenuItem(title: "再起動", action: #selector(relaunchSelf), keyEquivalent: "")
@@ -3637,7 +3769,84 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        if menu == item.menu { refreshCursorMenu(); refreshMenu() }
+        if menu == item.menu { refreshCursorMenu(); refreshMenu(); refreshRestartMenu() }
+    }
+
+    /// 見えている相手の一覧を、「他の端末を再起動」のサブメニューに作り直す
+    private func refreshRestartMenu() {
+        guard let sub = restartPeersItem?.submenu else { return }
+        sub.removeAllItems()
+        let now = Date()
+        let peers = LinkNet.peers.filter { $0.key != LinkNet.machineID && now.timeIntervalSince($0.value.seen) < 120 }
+        if peers.isEmpty {
+            let none = NSMenuItem(title: "（見えている端末がありません）", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            sub.addItem(none)
+            return
+        }
+        for (id, info) in peers.sorted(by: { $0.value.name < $1.value.name }) {
+            let it = NSMenuItem(title: "\(info.name)（\(id)）を再起動", action: #selector(restartPeer(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = id
+            sub.addItem(it)
+        }
+    }
+
+    @objc func restartPeer(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        let a = NSAlert()
+        a.messageText = "\(LinkNet.peers[id]?.name ?? id) を再起動しますか?"
+        a.informativeText = "再起動の合図を送ります。相手がこの Mac のコードでペアリング済みのときだけ、アプリが再起動します。"
+        a.addButton(withTitle: "再起動する")
+        a.addButton(withTitle: "キャンセル")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        Pairing.sendRestart(to: id)
+        NetLog.shared.log("再起動の合図を送りました: \(id)")
+    }
+
+    @objc func showPairCode() {
+        let a = NSAlert()
+        a.messageText = "ペアリングコード"
+        a.informativeText = "\(Pairing.pretty(Pairing.parentCode))\n\nこのコードを、再起動したい端末の「ペアリングコードを入力（子にする）」に入れてください。入れた端末を、この Mac から再起動できるようになります。\n\n「新しく発行」すると、これまでのペアリングは無効になります。"
+        a.addButton(withTitle: "コピー")
+        a.addButton(withTitle: "新しく発行")
+        a.addButton(withTitle: "閉じる")
+        NSApp.activate(ignoringOtherApps: true)
+        switch a.runModal() {
+        case .alertFirstButtonReturn:
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(Pairing.pretty(Pairing.parentCode), forType: .string)
+        case .alertSecondButtonReturn:
+            Pairing.regenerate()
+            showPairCode()
+        default: break
+        }
+    }
+
+    @objc func enterPairCode() {
+        let a = NSAlert()
+        a.messageText = "ペアリングコードを入力"
+        a.informativeText = "親の Mac に表示されたコード(例: ABCDE-FGHJK)を入力してください。"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.placeholderString = "XXXXX-XXXXX"
+        a.accessoryView = field
+        a.addButton(withTitle: "ペアリング")
+        a.addButton(withTitle: "キャンセル")
+        NSApp.activate(ignoringOtherApps: true)
+        a.window.initialFirstResponder = field
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        guard let code = Pairing.normalize(field.stringValue) else {
+            alert("コードが正しくありません", "10文字のコード(例: ABCDE-FGHJK)を入力してください。")
+            return
+        }
+        Pairing.addChildCode(code)
+        alert("ペアリングしました", "この端末は、コードを発行した Mac から再起動できるようになりました。")
+    }
+
+    @objc func clearPairCodes() {
+        Pairing.clearChildCodes()
+        alert("ペアリングを解除しました", "この端末は、リモート再起動を受け付けません。")
     }
 
     @objc func openLayoutEditor() {
@@ -3990,6 +4199,87 @@ final class Updater {
         do { try p.run() } catch { return -1 }
         p.waitUntilExit()
         return p.terminationStatus
+    }
+}
+
+// MARK: - ペアリングとリモート再起動
+
+/// 親(Mac)が発行したコードを子に入力しておくと、親から子のアプリを再起動できる。
+/// コードは通信に流さない。再起動の合図に、コードを鍵にした署名(HMAC-SHA256)を付けるだけ。
+/// 署名が合わない・時刻が古い・使い回された合図は子が無視する
+enum Pairing {
+    /// 紛らわしい文字(0 O 1 I L U)を除いた30文字。10文字で約49ビット
+    private static let alphabet = Array("23456789ABCDEFGHJKMNPQRSTVWXYZ")
+    static let codeLength = 10
+    /// 署名の時刻の許容差(秒)。親と子の時計がこれ以上ずれていると受け付けない
+    static let timeTolerance = 90
+
+    private static let parentKey = "pairParentCode"
+    private static let childKey = "pairChildCodes"
+    private static let lastTsKey = "pairLastRestartTs"
+
+    /// 入力を正規化する(空白・ハイフン を除き大文字に)。形が正しくなければ nil
+    static func normalize(_ input: String) -> String? {
+        let s = input.uppercased().filter { $0 != "-" && !$0.isWhitespace }
+        guard s.count == codeLength, s.allSatisfy({ alphabet.contains($0) }) else { return nil }
+        return s
+    }
+
+    static func pretty(_ code: String) -> String {
+        guard code.count == codeLength else { return code }
+        return String(code.prefix(5)) + "-" + String(code.suffix(5))
+    }
+
+    /// 親としてのコード(無ければ作る)
+    static var parentCode: String {
+        if let c = UserDefaults.standard.string(forKey: parentKey), normalize(c) != nil { return c }
+        return regenerate()
+    }
+
+    @discardableResult
+    static func regenerate() -> String {
+        let c = String((0..<codeLength).map { _ in alphabet.randomElement()! })
+        UserDefaults.standard.set(c, forKey: parentKey)
+        return c
+    }
+
+    /// 子として入力済みのコード(親ごとに別のコードを持てる)
+    static var childCodes: [String] {
+        UserDefaults.standard.stringArray(forKey: childKey) ?? []
+    }
+
+    static func addChildCode(_ code: String) {
+        var l = childCodes
+        if !l.contains(code) { l.append(code) }
+        UserDefaults.standard.set(Array(l.suffix(8)), forKey: childKey)
+    }
+
+    static func clearChildCodes() {
+        UserDefaults.standard.removeObject(forKey: childKey)
+    }
+
+    static func sign(code: String, from: String, target: String, ts: Int) -> String {
+        let msg = "restart|\(from)|\(target)|\(ts)"
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(msg.utf8), using: SymmetricKey(data: Data(code.utf8)))
+        return mac.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// 親: 相手を再起動する合図を送る
+    static func sendRestart(to id: String) {
+        let ts = Int(Date().timeIntervalSince1970)
+        let sig = sign(code: parentCode, from: LinkNet.machineID, target: id, ts: ts)
+        LinkNet.sendFast("restart \(id) \(ts) \(sig)")
+    }
+
+    /// 子: 受けた再起動の合図を確かめる。問題があれば理由を返す(nil = 受け付ける)
+    static func verifyRestart(from: String, target: String, ts: Int, sig: String, now: Int = Int(Date().timeIntervalSince1970)) -> String? {
+        let codes = childCodes
+        if codes.isEmpty { return "この端末はペアリングされていません" }
+        if abs(now - ts) > timeTolerance { return "時刻が \(timeTolerance) 秒以上ずれています(親と子の時計を確認してください)" }
+        guard codes.contains(where: { sign(code: $0, from: from, target: target, ts: ts) == sig }) else { return "署名が合いません(コードが違う可能性があります)" }
+        if ts <= UserDefaults.standard.integer(forKey: lastTsKey) { return "古い合図です" }
+        UserDefaults.standard.set(ts, forKey: lastTsKey)
+        return nil
     }
 }
 

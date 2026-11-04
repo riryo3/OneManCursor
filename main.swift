@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261101-71"
+let buildTag = "Build 20261102-72"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -3471,12 +3471,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshCursorMenu()
 
         let devices = Multitouch.start()
-        mtItem.title = devices > 0 ? "トラックパッド： 接続OK（\(devices)台）" : "トラックパッド： 接続失敗"
+        mtItem.title = devices > 0 ? "トラックパッド： 接続OK（\(devices)台）" : "トラックパッド： なし（共有経由のスワイプは使えます）"
         startTrackpadWatchdog(initialDevices: devices)
-        if devices == 0 {
-            alert("トラックパッドを読み込めませんでした",
-                  "MultitouchSupport を開くか、トラックパッドの検出に失敗しました。この Mac では試作方式が使えない可能性があります。")
-        }
+        // トラックパッドが無い Mac(Mac mini など)では警告を出さない。
+        // 後から接続されたら、watchdogTick が見つけて登録する
     }
 
     // MARK: 指データの監視(固まったら自動で登録し直す)
@@ -3504,6 +3502,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func watchdogTick() {
+        // トラックパッドが無い間は、つながっていないか探し直す(Bluetooth の後つなぎ対応)
+        if lastDeviceCount == 0 {
+            let n = Multitouch.start()
+            if n > 0 {
+                NetLog.shared.log("トラックパッドを検出: デバイス\(n)台")
+                lastDeviceCount = n
+                mtItem.title = "トラックパッド： 接続OK（\(n)台）"
+            }
+            return
+        }
         let (frames, maxF) = Engine.shared.takeWindowStats()
         if frames >= 30 && maxF <= 1 {
             reregisterTrackpads(reason: "自動検知")
@@ -3515,7 +3523,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NetLog.shared.log("指データを再登録: \(reason) (デバイス\(n)台)")
         if n != lastDeviceCount {
             lastDeviceCount = n
-            mtItem.title = n > 0 ? "トラックパッド： 接続OK（\(n)台）" : "トラックパッド： 接続失敗"
+            mtItem.title = n > 0 ? "トラックパッド： 接続OK（\(n)台）" : "トラックパッド： なし（共有経由のスワイプは使えます）"
         }
     }
 

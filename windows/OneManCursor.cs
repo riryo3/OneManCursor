@@ -1266,7 +1266,7 @@ internal static class Program
     // 新しい版があればトレイのメニューで知らせる。入れ替えはユーザーが「更新」を押したときだけ。
     // zip は GitHub が付ける SHA-256 と照合してから使う。動作中の exe は上書きできないが
     // 名前の変更はできるので、古い exe を .old にして新しい exe を置き、再起動する
-    private const string AppVersion = "1.1.6";
+    private const string AppVersion = "1.1.7";
     private const string ReleaseApi = "https://api.github.com/repos/riryo3/OneManCursor/releases/latest";
     private const string WinAsset = "OneManCursor-Windows.zip";
 

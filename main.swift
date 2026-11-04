@@ -11,7 +11,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261031-70"
+let buildTag = "Build 20261101-71"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -306,10 +306,23 @@ enum LinkNet {
     private static var pendingDy = 0
     private static var flushScheduled = false
 
+    /// handlePacket は UDP 受信スレッドと TCP の各接続スレッドから同時に呼ばれるので、
+    /// 下の共有辞書(peers / peerSizes / seenSeqs / seenFast)はこのロックの中でだけ触る
+    private static let stateLock = NSLock()
+
+    private static var _peers: [String: (name: String, ip: String, seen: Date)] = [:]
+    private static var _peerSizes: [String: (w: Int, h: Int)] = [:]
+
     /// 発見した相方(id → 名前・IP・最終確認時刻)
-    private(set) static var peers: [String: (name: String, ip: String, seen: Date)] = [:]
+    static var peers: [String: (name: String, ip: String, seen: Date)] {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _peers
+    }
     /// 相手の画面サイズ(hello で申告される。レイアウト編集のタイル比率に使う)
-    static var peerSizes: [String: (w: Int, h: Int)] = [:]
+    static var peerSizes: [String: (w: Int, h: Int)] {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _peerSizes
+    }
 
     // TCP 直結(到達と順序が保証されるので、キーの欠け対策の本命)
     static let tcpPort: UInt16 = 45988
@@ -532,17 +545,21 @@ enum LinkNet {
         if kind == "hello" {
             var tokens = parts.dropFirst(3).map { String($0) }
             // 末尾の解像度トークン(例 2560x1440)は名前ではないので分ける
+            var size: (w: Int, h: Int)?
             if let last = tokens.last {
                 let wh = last.split(separator: "x")
                 if wh.count == 2, let w = Int(wh[0]), let h = Int(wh[1]) {
-                    peerSizes[String(parts[0])] = (w, h)
+                    size = (w, h)
                     tokens.removeLast()
                 }
             }
             let name = tokens.joined(separator: " ")
             let dispName = name.isEmpty ? "Mac" : name
-            let prev = peers[String(parts[0])]?.seen
-            peers[String(parts[0])] = (dispName, ip, Date())
+            stateLock.lock()
+            if let size { _peerSizes[String(parts[0])] = size }
+            let prev = _peers[String(parts[0])]?.seen
+            _peers[String(parts[0])] = (dispName, ip, Date())
+            stateLock.unlock()
             var names = UserDefaults.standard.dictionary(forKey: "layoutNames") as? [String: String] ?? [:]
             if names[String(parts[0])] != dispName {
                 names[String(parts[0])] = dispName
@@ -558,18 +575,28 @@ enum LinkNet {
         if SwipeAction.fromWire(kind) != nil {
             // スワイプの合図: 複数回・複数経路で届く同じものは1回だけ実行する
             let now = Date().timeIntervalSince1970
-            if let seen = seenSeqs[seq], now - seen < 2 { return }
-            seenSeqs[seq] = now
-            seenSeqs = seenSeqs.filter { now - $0.value < 10 }
+            stateLock.lock()
+            let dup = seenSeqs[seq].map { now - $0 < 2 } ?? false
+            if !dup {
+                seenSeqs[seq] = now
+                seenSeqs = seenSeqs.filter { now - $0.value < 10 }
+            }
+            stateLock.unlock()
+            if dup { return }
             NetLog.shared.log("受信 \(kind) from=\(parts[0]) → スワイプ処理")
             Engine.shared.receiveLink(kind)
         } else {
             // カーソル共有の合図: UDP では3回送られてくるので、同じ連番は1回だけ処理する
             let dupKey = "\(parts[0])-\(seq)"
             let nowFast = Date().timeIntervalSince1970
-            if let seen = seenFast[dupKey], nowFast - seen < 2 { return }
-            seenFast[dupKey] = nowFast
-            seenFast = seenFast.filter { nowFast - $0.value < 10 }
+            stateLock.lock()
+            let dup = seenFast[dupKey].map { nowFast - $0 < 2 } ?? false
+            if !dup {
+                seenFast[dupKey] = nowFast
+                seenFast = seenFast.filter { nowFast - $0.value < 10 }
+            }
+            stateLock.unlock()
+            if dup { return }
             if kind != "mv" && kind != "dn" && kind != "up" && kind != "sc" && kind != "kd" && kind != "ku" && kind != "fl" { NetLog.shared.log("受信 \(kind) from=\(parts[0]) → 共有処理") }
             CursorShare.shared.receive(kind, args: parts.dropFirst(3).map { String($0) }, from: String(parts[0]))
         }

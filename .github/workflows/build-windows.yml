@@ -1,0 +1,46 @@
+name: Build Windows
+
+# リリースを公開すると、Windows 用の exe をビルドして zip をそのリリースに添付する。
+# 手動で動かすときは、Actions 画面からタグ(例: v1.1.6)を指定する
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'zip を添付するリリースのタグ (例: v1.1.6)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Build OneManCursor.exe
+        shell: pwsh
+        working-directory: windows
+        run: |
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          & $csc /nologo /platform:x64 /target:winexe /out:OneManCursor.exe `
+            /reference:System.Windows.Forms.dll /reference:System.Drawing.dll OneManCursor.cs
+          if ($LASTEXITCODE -ne 0) { throw 'ビルドに失敗しました' }
+
+      - name: Make zip
+        shell: pwsh
+        working-directory: windows
+        run: |
+          Compress-Archive -Path OneManCursor.exe, OneManCursor.cs, README-Windows.txt, build.bat `
+            -DestinationPath ../OneManCursor-Windows.zip
+
+      - name: Upload to release
+        shell: pwsh
+        run: gh release upload "$env:TAG" OneManCursor-Windows.zip --clobber --repo "${{ github.repository }}"

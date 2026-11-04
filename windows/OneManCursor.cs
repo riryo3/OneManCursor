@@ -18,6 +18,9 @@ using System.Runtime.InteropServices;
 using System.Drawing;
 using System.Diagnostics;
 using System.Drawing.Imaging;
+using System.IO.Compression;
+using System.Security.Cryptography;
+using System.Web.Script.Serialization;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -43,7 +46,7 @@ internal static class Program
     // マシンの色(ID → "#RRGGBB")。Mac 側の割り当てで配られる(将来のボーダー表示用に保持)
     private static Dictionary<string, string> colorMap = new Dictionary<string, string>();
     // ビルド番号(版の確認用。機能を変えたら上げる)
-    private const string BuildTag = "Build 20261102-72";
+    private const string BuildTag = "Build 20261102-74";
 
     private static string SpecId(string spec)
     {
@@ -1259,10 +1262,241 @@ internal static class Program
         return Icon.FromHandle(bmp.GetHicon());
     }
 
+    // ---- 更新の確認と入れ替え(GitHub Releases) ----
+    // 新しい版があればトレイのメニューで知らせる。入れ替えはユーザーが「更新」を押したときだけ。
+    // zip は GitHub が付ける SHA-256 と照合してから使う。動作中の exe は上書きできないが
+    // 名前の変更はできるので、古い exe を .old にして新しい exe を置き、再起動する
+    private const string AppVersion = "1.1.6";
+    private const string ReleaseApi = "https://api.github.com/repos/riryo3/OneManCursor/releases/latest";
+    private const string WinAsset = "OneManCursor-Windows.zip";
+
+    private sealed class UpdateInfo
+    {
+        public string Version;
+        public string ZipUrl;
+        public string Sha256;
+        public string PageUrl;
+    }
+
+    private static UpdateInfo updateAvailable;
+    private static bool updating;
+
+    private static bool IsNewerVersion(string a, string b)
+    {
+        string[] x = a.Split('.');
+        string[] y = b.Split('.');
+        int n = Math.Max(x.Length, y.Length);
+        for (int i = 0; i < n; i++)
+        {
+            int p = 0, q = 0;
+            if (i < x.Length) int.TryParse(x[i], out p);
+            if (i < y.Length) int.TryParse(y[i], out q);
+            if (p != q) return p > q;
+        }
+        return false;
+    }
+
+    private static object JsonGet(object o, string key)
+    {
+        Dictionary<string, object> d = o as Dictionary<string, object>;
+        object v;
+        if (d != null && d.TryGetValue(key, out v)) return v;
+        return null;
+    }
+
+    /// 最新リリースを調べる。失敗したら理由を返す(null = 成功)。新しい版が無ければ info は null
+    private static string QueryLatestRelease(out UpdateInfo info)
+    {
+        info = null;
+        try
+        {
+            ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; // TLS 1.2
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(ReleaseApi);
+            req.UserAgent = "OneManCursor/" + AppVersion;
+            req.Accept = "application/vnd.github+json";
+            req.Timeout = 20000;
+            string json;
+            using (WebResponse resp = req.GetResponse())
+            using (StreamReader r = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                json = r.ReadToEnd();
+            JavaScriptSerializer ser = new JavaScriptSerializer();
+            object root = ser.DeserializeObject(json);
+            string tag = JsonGet(root, "tag_name") as string;
+            if (tag == null) return "リリース情報を読めませんでした";
+            string version = tag.StartsWith("v") ? tag.Substring(1) : tag;
+            if (!IsNewerVersion(version, AppVersion)) return null;
+            string page = JsonGet(root, "html_url") as string;
+            if (page == null) page = "https://github.com/riryo3/OneManCursor/releases/latest";
+            System.Collections.IEnumerable assets = JsonGet(root, "assets") as System.Collections.IEnumerable;
+            if (assets != null)
+            {
+                foreach (object a in assets)
+                {
+                    if ((JsonGet(a, "name") as string) != WinAsset) continue;
+                    string url = JsonGet(a, "browser_download_url") as string;
+                    string digest = JsonGet(a, "digest") as string;
+                    if (url == null || !url.StartsWith("https://") || digest == null || !digest.StartsWith("sha256:")) break;
+                    UpdateInfo u = new UpdateInfo();
+                    u.Version = version;
+                    u.ZipUrl = url;
+                    u.Sha256 = digest.Substring(7).ToLowerInvariant();
+                    u.PageUrl = page;
+                    info = u;
+                    return null;
+                }
+            }
+            return "v" + version + " の更新ファイルまたは SHA-256 が見つかりません。リリースのページから手動で更新してください";
+        }
+        catch (Exception e)
+        {
+            return "GitHub に接続できませんでした: " + e.Message;
+        }
+    }
+
+    /// 前回の更新で残った古い exe を片付ける(起動時)
+    private static void CleanOldExe()
+    {
+        try { File.Delete(Application.ExecutablePath + ".old"); } catch (Exception) { }
+    }
+
+    /// ダウンロード → SHA-256 照合 → 展開 → 入れ替え。成功したら null、失敗したら理由を返す
+    private static string DownloadAndSwap(UpdateInfo info)
+    {
+        string exe = Application.ExecutablePath;
+        string dir = Path.GetDirectoryName(exe);
+        string work = Path.Combine(Path.GetTempPath(), "OneManCursor-update-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            // 置き場所に書き込めるか(Program Files などでは自動入れ替えできない)
+            string probe = Path.Combine(dir, ".update-probe");
+            try { File.WriteAllText(probe, ""); File.Delete(probe); }
+            catch (Exception)
+            {
+                return "この場所(" + dir + ")には書き込めないため、自動で入れ替えできません。リリースのページからダウンロードして、手動で入れ替えてください";
+            }
+            Directory.CreateDirectory(work);
+            string zip = Path.Combine(work, "update.zip");
+            ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+            using (WebClient wc = new WebClient())
+            {
+                wc.Headers[HttpRequestHeader.UserAgent] = "OneManCursor/" + AppVersion;
+                wc.DownloadFile(info.ZipUrl, zip);
+            }
+            string hash;
+            using (FileStream fs = File.OpenRead(zip))
+            using (SHA256 sha = SHA256.Create())
+            {
+                StringBuilder sb = new StringBuilder();
+                foreach (byte b in sha.ComputeHash(fs)) sb.Append(b.ToString("x2"));
+                hash = sb.ToString();
+            }
+            if (hash != info.Sha256) return "ダウンロードしたファイルの SHA-256 が一致しません。更新を中止しました";
+            string ex = Path.Combine(work, "x");
+            ZipFile.ExtractToDirectory(zip, ex);
+            string newExe = Path.Combine(ex, "OneManCursor.exe");
+            if (!File.Exists(newExe) || new FileInfo(newExe).Length < 10000) return "展開したアプリの検証に失敗しました。更新を中止しました";
+
+            string old = exe + ".old";
+            try { if (File.Exists(old)) File.Delete(old); } catch (Exception) { }
+            File.Move(exe, old);
+            try
+            {
+                File.Move(newExe, exe);
+            }
+            catch (Exception)
+            {
+                File.Move(old, exe); // 置けなかったら元に戻す
+                throw;
+            }
+            // ソースや説明は、あれば上書きする(失敗しても更新は続ける)
+            foreach (string name in new string[] { "OneManCursor.cs", "README-Windows.txt", "build.bat" })
+            {
+                try
+                {
+                    string src = Path.Combine(ex, name);
+                    if (File.Exists(src)) File.Copy(src, Path.Combine(dir, name), true);
+                }
+                catch (Exception) { }
+            }
+            return null;
+        }
+        catch (Exception e)
+        {
+            return "更新に失敗しました: " + e.Message;
+        }
+        finally
+        {
+            try { Directory.Delete(work, true); } catch (Exception) { }
+        }
+    }
+
     private sealed class TrayContext : ApplicationContext
     {
         private readonly NotifyIcon icon;
         private readonly ToolStripMenuItem cursorItem;
+        private ToolStripMenuItem updateItem;
+        private ToolStripMenuItem updateAutoItem;
+
+        private void RefreshUpdateItem()
+        {
+            if (updateAvailable != null)
+            {
+                updateItem.Text = "新しい版があります: v" + updateAvailable.Version + "（更新…）";
+                updateItem.Visible = true;
+            }
+            else updateItem.Visible = false;
+        }
+
+        /// 最新リリースを確認する。manual のときは結果をダイアログで知らせる
+        private void CheckUpdate(bool manual)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                UpdateInfo info;
+                string err = QueryLatestRelease(out info);
+                uiCtx.Post(delegate
+                {
+                    if (err == null) updateAvailable = info;
+                    Log("更新確認: " + (err != null ? "失敗 " + err : info != null ? "新しい版 v" + info.Version : "最新です (v" + AppVersion + ")"));
+                    RefreshUpdateItem();
+                    if (!manual) return;
+                    if (err != null) MessageBox.Show(err, "更新を確認できませんでした");
+                    else if (info == null) MessageBox.Show("v" + AppVersion + " は最新です。", "最新の版です");
+                    else InstallUpdate();
+                }, null);
+            });
+        }
+
+        private void InstallUpdate()
+        {
+            UpdateInfo info = updateAvailable;
+            if (info == null || updating) return;
+            DialogResult r = MessageBox.Show(
+                "v" + AppVersion + " → v" + info.Version + "\r\nダウンロードして入れ替え、アプリを再起動します。\r\n\r\n[はい] 更新して再起動 / [いいえ] リリースのページを開く / [キャンセル] あとで",
+                "v" + info.Version + " に更新しますか?", MessageBoxButtons.YesNoCancel);
+            if (r == DialogResult.No) { try { Process.Start(info.PageUrl); } catch (Exception) { } return; }
+            if (r != DialogResult.Yes) return;
+            updating = true;
+            Log("更新: v" + info.Version + " をダウンロードしています");
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string err = DownloadAndSwap(info);
+                uiCtx.Post(delegate
+                {
+                    if (err != null)
+                    {
+                        updating = false;
+                        Log("更新: " + err);
+                        MessageBox.Show(err, "更新できませんでした");
+                        return;
+                    }
+                    Log("更新: v" + info.Version + " へ入れ替えて再起動します");
+                    if (Relaunch(IsElevated())) { icon.Visible = false; Environment.Exit(0); }
+                    updating = false;
+                    MessageBox.Show("入れ替えは終わりました。アプリを終了して、もう一度起動してください。", "更新");
+                }, null);
+            });
+        }
 
         public TrayContext()
         {
@@ -1306,6 +1540,22 @@ internal static class Program
             };
             menu.Items.Add(adminItem);
             menu.Items.Add(new ToolStripSeparator());
+            updateItem = new ToolStripMenuItem("");
+            updateItem.Visible = false;
+            updateItem.Click += delegate { InstallUpdate(); };
+            menu.Items.Add(updateItem);
+            menu.Items.Add("更新を確認", null, delegate { CheckUpdate(true); });
+            updateAutoItem = new ToolStripMenuItem("更新を自動で確認（1日1回）");
+            string uc;
+            updateAutoItem.Checked = !(configKv.TryGetValue("updatecheck", out uc) && uc == "0");
+            updateAutoItem.Click += delegate
+            {
+                updateAutoItem.Checked = !updateAutoItem.Checked;
+                configKv["updatecheck"] = updateAutoItem.Checked ? "" : "0";
+                SaveConfig();
+            };
+            menu.Items.Add(updateAutoItem);
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("再起動", null, delegate
             {
                 // 二重起動防止の Mutex を先に手放さないと、新しいプロセスが弾かれる
@@ -1327,6 +1577,15 @@ internal static class Program
             watch.Interval = 250;
             watch.Tick += delegate { try { WatchDesktop(); } catch (Exception) { } };
             watch.Start();
+            // 更新の確認: 起動の少しあとに1回、その後は1日1回
+            System.Windows.Forms.Timer updTimer = new System.Windows.Forms.Timer();
+            updTimer.Interval = 15000;
+            updTimer.Tick += delegate
+            {
+                updTimer.Interval = 24 * 3600 * 1000;
+                if (updateAutoItem.Checked) CheckUpdate(false);
+            };
+            updTimer.Start();
         }
 
         private void Exit()
@@ -1348,6 +1607,7 @@ internal static class Program
             return;
         }
         LoadConfig();
+        CleanOldExe();
         string adm;
         if (configKv.TryGetValue("admin", out adm) && adm == "1" && !IsElevated() && Relaunch(true)) return;
         sender = new UdpClient();

@@ -8,6 +8,8 @@
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.onemancursor</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.1.6</string>
 	<key>CFBundleName</key>
 	<string>OneManCursor</string>
 	<key>CFBundleDisplayName</key>

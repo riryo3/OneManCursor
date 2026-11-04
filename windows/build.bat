@@ -7,7 +7,7 @@ if not exist "%CSC%" (
   pause
   exit /b 1
 )
-"%CSC%" /nologo /platform:x64 /target:winexe /out:OneManCursor.exe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll OneManCursor.cs
+"%CSC%" /nologo /platform:x64 /target:winexe /out:OneManCursor.exe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Web.Extensions.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll OneManCursor.cs
 if errorlevel 1 (
   echo Build failed.
   pause

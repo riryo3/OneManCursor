@@ -4,6 +4,7 @@ import IOKit
 import ServiceManagement
 import UniformTypeIdentifiers
 import ScreenCaptureKit
+import CryptoKit
 
 // OneManCursor: Finder でスワイプ操作するための常駐アプリ(試作)
 // - 2本指の横フリック → 戻る(⌘[) / 進む(⌘])
@@ -11,7 +12,7 @@ import ScreenCaptureKit
 // Finder が最前面のときだけ効く。指の動きは MultitouchSupport(Private)で直接読む。
 
 /// ビルド番号(版の確認用。機能を変えたら上げる)
-let buildTag = "Build 20261102-73"
+let buildTag = "Build 20261102-74"
 
 // MARK: - MultitouchSupport の型(コミュニティで知られている定義)
 
@@ -3317,6 +3318,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var logItem: NSMenuItem!
     private var logWC: LogWindowController?
     var loginItem: NSMenuItem!
+    var updateItem: NSMenuItem!
+    var updateAutoItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ n: Notification) {
         migrateDefaultsIfNeeded()
@@ -3414,6 +3417,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.target = self
         menu.addItem(cursorShowItem); menu.addItem(shapeParent); menu.addItem(cursorSettingsItem); menu.addItem(loginItem); menu.addItem(.separator())
+        updateItem = NSMenuItem(title: "", action: #selector(installUpdate), keyEquivalent: "")
+        updateItem.target = self
+        updateItem.isHidden = true
+        let updateCheckItem = NSMenuItem(title: "更新を確認", action: #selector(checkUpdateNow), keyEquivalent: "")
+        updateCheckItem.target = self
+        updateAutoItem = NSMenuItem(title: "更新を自動で確認（1日1回）", action: #selector(toggleUpdateAuto), keyEquivalent: "")
+        updateAutoItem.target = self
+        updateAutoItem.state = Updater.shared.autoCheck ? .on : .off
+        menu.addItem(updateItem); menu.addItem(updateCheckItem); menu.addItem(updateAutoItem); menu.addItem(.separator())
+        Updater.shared.onChange = { [weak self] in self?.refreshUpdateItem() }
         menu.delegate = self
         let relaunchItem = NSMenuItem(title: "再起動", action: #selector(relaunchSelf), keyEquivalent: "")
         relaunchItem.target = self
@@ -3469,6 +3482,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         cursorOverlay.start()
         refreshCursorMenu()
+        // 起動直後の負荷を避けて、少し待ってから更新を確認する
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { Updater.shared.start() }
 
         let devices = Multitouch.start()
         mtItem.title = devices > 0 ? "トラックパッド： 接続OK（\(devices)台）" : "トラックパッド： なし（共有経由のスワイプは使えます）"
@@ -3737,6 +3752,48 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         CursorShare.shared.requestInputAccessNow()
     }
 
+    func refreshUpdateItem() {
+        if let info = Updater.shared.available {
+            updateItem.title = "新しい版があります: v\(info.version)（更新…）"
+            updateItem.isHidden = false
+        } else {
+            updateItem.isHidden = true
+        }
+    }
+
+    @objc func checkUpdateNow() {
+        Updater.shared.check { [weak self] result in
+            switch result {
+            case .upToDate: self?.alert("最新の版です", "v\(appVersion) は最新です。")
+            case .available: self?.installUpdate()
+            case .failed(let m): self?.alert("更新を確認できませんでした", m)
+            }
+        }
+    }
+
+    @objc func installUpdate() {
+        guard let info = Updater.shared.available else { return }
+        let a = NSAlert()
+        a.messageText = "v\(info.version) に更新しますか?"
+        a.informativeText = "v\(appVersion) → v\(info.version)。ダウンロードして入れ替え、アプリを再起動します。\n更新のあと、デバイスの制御とデータへのアクセス・入力監視の許可をつけ直す必要が出ることがあります。"
+        a.addButton(withTitle: "更新して再起動")
+        a.addButton(withTitle: "リリースのページを開く")
+        a.addButton(withTitle: "あとで")
+        NSApp.activate(ignoringOtherApps: true)
+        switch a.runModal() {
+        case .alertFirstButtonReturn:
+            Updater.shared.install(info) { [weak self] msg in self?.alert("更新できませんでした", msg) }
+        case .alertSecondButtonReturn:
+            NSWorkspace.shared.open(info.pageURL)
+        default: break
+        }
+    }
+
+    @objc func toggleUpdateAuto() {
+        Updater.shared.autoCheck.toggle()
+        updateAutoItem.state = Updater.shared.autoCheck ? .on : .off
+    }
+
     func alert(_ title: String, _ text: String) {
         let a = NSAlert()
         a.messageText = title
@@ -3744,6 +3801,195 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         a.addButton(withTitle: "OK")
         NSApp.activate(ignoringOtherApps: true)
         a.runModal()
+    }
+}
+
+// MARK: - 更新の確認と入れ替え(GitHub Releases)
+
+/// アプリの版番号。Info.plist の CFBundleShortVersionString(リリースのタグ v1.1.6 の 1.1.6 と同じ)
+let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+
+/// GitHub の最新リリースを見て、新しい版があればメニューで知らせる。
+/// 入れ替えはユーザーが「更新」を押したときだけ。zip は SHA-256 を照合してから使う
+final class Updater {
+    static let shared = Updater()
+
+    struct Info {
+        let version: String
+        let zipURL: URL
+        let sha256: String
+        let pageURL: URL
+    }
+
+    enum Result { case upToDate, available(Info), failed(String) }
+
+    private static let apiURL = URL(string: "https://api.github.com/repos/riryo3/OneManCursor/releases/latest")!
+    private static let assetName = "OneManCursor.zip"
+
+    private(set) var available: Info?
+    /// 新しい版の有無が変わったときに呼ぶ(メインスレッド)
+    var onChange: (() -> Void)?
+    private var timer: Timer?
+    private var installing = false
+
+    var autoCheck: Bool {
+        get { UserDefaults.standard.object(forKey: "updateAutoCheck") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "updateAutoCheck") }
+    }
+
+    /// 起動時と、その後は1日1回確認する
+    func start() {
+        timer?.invalidate()
+        let t = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
+            guard let self, self.autoCheck else { return }
+            self.check { _ in }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        if autoCheck { check { _ in } }
+    }
+
+    /// "1.1.10" > "1.1.9" のように数字で比べる
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        let x = a.split(separator: ".").map { Int($0) ?? 0 }
+        let y = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0
+            let q = i < y.count ? y[i] : 0
+            if p != q { return p > q }
+        }
+        return false
+    }
+
+    /// 最新リリースの JSON から、更新情報を取り出す(新しくなければ nil)
+    static func parse(_ data: Data, current: String) -> Result {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tag = obj["tag_name"] as? String else { return .failed("リリース情報を読めませんでした") }
+        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        guard isNewer(version, than: current) else { return .upToDate }
+        let page = (obj["html_url"] as? String).flatMap(URL.init(string:))
+            ?? URL(string: "https://github.com/riryo3/OneManCursor/releases/latest")!
+        guard let assets = obj["assets"] as? [[String: Any]],
+              let a = assets.first(where: { ($0["name"] as? String) == assetName }),
+              let urlStr = a["browser_download_url"] as? String, let url = URL(string: urlStr),
+              url.scheme == "https",
+              let digest = a["digest"] as? String, digest.hasPrefix("sha256:") else {
+            return .failed("v\(version) の更新ファイルまたは SHA-256 が見つかりません。リリースのページから手動で更新してください")
+        }
+        return .available(Info(version: version, zipURL: url, sha256: String(digest.dropFirst(7)).lowercased(), pageURL: page))
+    }
+
+    func check(_ done: @escaping (Result) -> Void) {
+        var req = URLRequest(url: Self.apiURL, timeoutInterval: 20)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("OneManCursor/\(appVersion)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+            let result: Result
+            if let data, (resp as? HTTPURLResponse)?.statusCode == 200 {
+                result = Self.parse(data, current: appVersion)
+            } else {
+                result = .failed(err?.localizedDescription ?? "GitHub から応答がありません")
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .available(let info): self.available = info
+                case .upToDate: self.available = nil
+                case .failed: break
+                }
+                NetLog.shared.log("更新確認: " + { () -> String in
+                    switch result {
+                    case .upToDate: return "最新です (v\(appVersion))"
+                    case .available(let i): return "新しい版 v\(i.version)"
+                    case .failed(let m): return "失敗 \(m)"
+                    }
+                }())
+                self.onChange?()
+                done(result)
+            }
+        }.resume()
+    }
+
+    // MARK: 入れ替え
+
+    /// ダウンロード → 照合 → 展開 → 検証 → 終了して入れ替え・再起動。失敗したら fail に理由を渡す
+    func install(_ info: Info, fail: @escaping (String) -> Void) {
+        guard !installing else { return }
+        let dest = Bundle.main.bundleURL
+        let parent = dest.deletingLastPathComponent().path
+        if dest.path.contains("/AppTranslocation/") || !FileManager.default.isWritableFile(atPath: parent) {
+            fail("このアプリの置き場所(\(parent))では自動で入れ替えできません。リリースのページからダウンロードして、手動で入れ替えてください")
+            return
+        }
+        installing = true
+        let work = FileManager.default.temporaryDirectory.appendingPathComponent("OneManCursor-update-\(UUID().uuidString)")
+        let failMain: (String) -> Void = { [weak self] msg in
+            try? FileManager.default.removeItem(at: work)
+            DispatchQueue.main.async { self?.installing = false; fail(msg) }
+        }
+        do { try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true) }
+        catch { failMain("作業フォルダを作れませんでした"); return }
+
+        URLSession.shared.downloadTask(with: info.zipURL) { [weak self] tmp, resp, err in
+            guard let self else { return }
+            guard let tmp, (resp as? HTTPURLResponse)?.statusCode == 200 else {
+                failMain("ダウンロードに失敗しました: " + (err?.localizedDescription ?? "応答エラー")); return
+            }
+            let zip = work.appendingPathComponent("update.zip")
+            do { try FileManager.default.moveItem(at: tmp, to: zip) } catch { failMain("ダウンロードしたファイルを保存できませんでした"); return }
+            guard let data = try? Data(contentsOf: zip, options: .mappedIfSafe),
+                  SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == info.sha256 else {
+                failMain("ダウンロードしたファイルの SHA-256 が一致しません。更新を中止しました"); return
+            }
+            let out = work.appendingPathComponent("x")
+            guard Self.run("/usr/bin/ditto", ["-x", "-k", zip.path, out.path]) == 0 else { failMain("zip を展開できませんでした"); return }
+            let newApp = out.appendingPathComponent("OneManCursor.app")
+            let plist = newApp.appendingPathComponent("Contents/Info.plist")
+            guard let dict = NSDictionary(contentsOf: plist),
+                  dict["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier,
+                  dict["CFBundleShortVersionString"] as? String == info.version,
+                  Self.run("/usr/bin/codesign", ["--verify", "--deep", newApp.path]) == 0 else {
+                failMain("展開したアプリの検証に失敗しました。更新を中止しました"); return
+            }
+            let script = work.appendingPathComponent("swap.sh")
+            let sh = """
+            #!/bin/sh
+            # $1=旧アプリのPID $2=新アプリ $3=置き先 $4=作業フォルダ
+            while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
+            rm -rf "$3.old"
+            mv "$3" "$3.old" || exit 1
+            if mv "$2" "$3"; then
+              xattr -dr com.apple.quarantine "$3" 2>/dev/null
+              open "$3"
+              rm -rf "$3.old"
+            else
+              mv "$3.old" "$3"
+              open "$3"
+            fi
+            rm -rf "$4"
+            """
+            do { try sh.write(to: script, atomically: true, encoding: .utf8) } catch { failMain("入れ替え用のスクリプトを作れませんでした"); return }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.arguments = [script.path, String(ProcessInfo.processInfo.processIdentifier), newApp.path, dest.path, work.path]
+            do { try p.run() } catch { failMain("入れ替えを開始できませんでした"); return }
+            NetLog.shared.log("更新: v\(info.version) へ入れ替えて再起動します")
+            DispatchQueue.main.async {
+                LinkNet.sendReset()
+                NSApp.terminate(nil)
+            }
+        }.resume()
+    }
+
+    private static func run(_ path: String, _ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
     }
 }
 
